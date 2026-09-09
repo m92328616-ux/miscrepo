@@ -756,6 +756,8 @@ def run_machine():
 		if len(lines) * line_height > area.height:
 			lines = lines[-3:]
 			lines[0].insert(0, ("...", ""))
+		label_height = translation_font.get_linesize()
+		morse_height = morse_font.get_linesize()
 		for row, line in enumerate(lines):
 			x_position = area.x
 			y_position = area.y + row * line_height
@@ -763,7 +765,7 @@ def run_machine():
 				label = translation_font.render(f"[{character}]", True, accent)
 				pattern = morse_font.render(code, True, text_color)
 				screen.blit(label, (x_position, y_position))
-				screen.blit(pattern, (x_position, y_position + translation_font.get_linesize()))
+				screen.blit(pattern, (x_position, y_position + label_height + (line_height - label_height - morse_height) // 2))
 				x_position += max(label.get_width(), pattern.get_width()) + 18
 
 	def show_help():
@@ -889,13 +891,13 @@ def run_machine():
 					signal = "." if event.key == pygame.K_PERIOD else "-"
 					record_signal(signal, now)
 					play_signal(signal)
-				elif mode != "Keyboard Buttons" and event.key == pygame.K_SPACE and press_started is None:
+				elif mode not in ("Keyboard Buttons", "Translator Mode") and event.key == pygame.K_SPACE and press_started is None:
 					press_started = now
 					last_dot = now
 					dot_emitted = False
 			elif event.type == pygame.TEXTINPUT and mode == "Translator Mode":
 				translator_text += event.text
-			elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
+			elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and mode != "Translator Mode":
 				if press_started is not None:
 					if mode == "Duration Mode":
 						signal = "-" if now - press_started >= dash_threshold else "."
