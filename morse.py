@@ -1,3 +1,4 @@
+import numpy as np
 from functools import lru_cache
 
 
@@ -225,15 +226,17 @@ class MorseListener:
 	"""Capture Morse from the microphone and decode it to text.
 
 	Runs a background thread that samples the mic, detects tone on/off with
-	an adaptive, self-calibrating energy threshold (the "AI-assisted key
-	detection": it tracks background noise and adapts to the sender's
-	volume and speed instead of using a fixed cutoff), measures each key
-	press as a dot or dash, and uses the gaps between presses to split
-	letters and words.  Decoded characters are pushed to ``out_queue`` for
-	the caller to drain.
+	an adaptive, self-calibrating energy threshold, measures each key
+	press as a dot or dash by comparing durations relative to each other,
+	and uses the gaps between presses to split letters and words.  Decoded
+	characters are pushed to ``out_queue`` for the caller to drain.
 
-	The most recent partial letter is exposed through :attr:`partial_code`,
-	and whether a tone is currently being heard through :attr:`signal_active`.
+	Uses FFT-based tonality analysis to filter out human speech and only
+	responds to pure tones characteristic of machine-generated Morse code.
+
+	Dot/dash classification uses sliding-window clustering: signal durations
+	are collected and the largest natural gap between them is found to
+	determine the separation threshold, rather than using fixed ratios.
 	"""
 
 	def __init__(self, chunk_ms=15, sample_rate=44100, noise_factor=2.5, min_amp=0.02):
@@ -258,14 +261,35 @@ class MorseListener:
 		self._thread = None
 		self._buffer = []
 
+		# Sliding-window duration buffer for relative dot/dash classification
+		self._duration_buf = []
+		self._duration_buf_max = 60
+		self._split_ms = [0.0]
+		self._split_smooth = [None]
+		# First few unclassified signals, held until we can compare them to
+		# each other.  None = warm-up over, signals stream immediately.
+		self._pending = None
+		self._warmup_min = 6
+
+		# Rolling window used for FFT-based speech filtering
+		self._tonal_samples = []
+
+		# FFT tonality tracking for speech filtering
+		self._is_speech = [False]
+		self._tonal_confirm_needed = 3
+
+	@property
+	def is_speech(self):
+		return self._is_speech[0]
+
 	def start(self):
 		"""Open the microphone and begin decoding in the background."""
 		import threading
 		import sounddevice as sd
 		if self._running:
 			return
-		self._buffer = []
 		self._running = True
+		self._reset_session()
 		self._stream = sd.InputStream(
 			samplerate=self.sample_rate,
 			channels=1,
@@ -276,6 +300,17 @@ class MorseListener:
 		self._stream.start()
 		self._thread = threading.Thread(target=self._run, daemon=True, name="morse-listener")
 		self._thread.start()
+
+	def _reset_session(self):
+		"""Clear everything learned from a previous recording session."""
+		self._buffer = []
+		self._is_speech[0] = False
+		self._duration_buf = []
+		self._split_ms[0] = 0.0
+		self._split_smooth[0] = None
+		self._unit_ms[0] = 90.0
+		self._pending = []
+		self._tonal_samples = []
 
 	def _fill(self, indata, frames, time_info, status):
 		if status or not self._running:
@@ -310,37 +345,139 @@ class MorseListener:
 
 	@property
 	def dot_ms(self):
-		"""Duration of the most recent dot, stretched by slow-motion."""
 		return self._last_dot_ms[0]
 
 	@property
 	def dash_ms(self):
-		"""Duration of the most recent dash, stretched by slow-motion."""
 		return self._last_dash_ms[0]
 
 	@property
 	def gap_ms(self):
-		"""Most recent inter-key gap, stretched by slow-motion."""
 		return self._last_gap_ms[0]
 
 	@property
 	def unit_ms(self):
-		"""Calibrated dot-unit length, stretched by slow-motion."""
 		return self._unit_ms[0]
 
+	# ---- Speech filtering via FFT tonality analysis ----
+
+	@staticmethod
+	def _is_tonal(block, sample_rate):
+		"""Return True if *block* sounds like a pure tone (morse beep),
+		False if it sounds like speech or broadband noise.
+
+		Computes the FFT of the block, finds the dominant frequency, and
+		checks what fraction of total energy lives in a narrow band around
+		it.  A pure tone concentrates almost all energy in one peak; speech
+	 spreads energy across many frequencies.
+		"""
+		arr = np.array(block, dtype=np.float32)
+		n = len(arr)
+		if n < 64:
+			return False
+		spectrum = np.abs(np.fft.rfft(arr * np.hanning(n)))
+		if spectrum.max() < 1e-6:
+			return False
+		spectrum /= spectrum.max()
+		bin_hz = sample_rate / n
+		dominant_bin = int(np.argmax(spectrum))
+		dominant_freq = dominant_bin * bin_hz
+		if dominant_freq < 100 or dominant_freq > 4000:
+			return False
+		bandwidth_bins = max(int(150 / bin_hz), 2)
+		low = max(0, dominant_bin - bandwidth_bins)
+		high = min(len(spectrum), dominant_bin + bandwidth_bins + 1)
+		tonal_energy = float(np.sum(spectrum[low:high] ** 2))
+		total_energy = float(np.sum(spectrum ** 2))
+		if total_energy < 1e-12:
+			return False
+		tonal_ratio = tonal_energy / total_energy
+		return tonal_ratio > 0.55
+
+	# ---- Dot/dash clustering via relative comparison ----
+
+	@staticmethod
+	def _cluster_threshold(durations):
+		"""Find the best dot/dash split within *durations*.
+
+		Returns (threshold, quality) where threshold is the midpoint of the
+		largest natural gap between consecutive sorted durations, or
+		(None, 0.0) when the durations show no convincing separation (e.g.
+		everything is a similar length, so there is no reason to call
+		anything a dash).
+
+		With exactly two signals it already works: if one is clearly longer
+		than the other (>= 2x), the longer is a dash and the shorter a dot.
+		"""
+		if len(durations) < 2:
+			return None, 0.0
+		s = sorted(durations)
+		lo, hi = s[0], s[-1]
+		if len(s) == 2:
+			if hi >= lo * 2.0 and hi - lo >= 25.0:
+				return (lo + hi) / 2.0, 1.0
+			return None, 0.0
+		spread = hi - lo
+		if spread < 15.0:
+			return None, 0.0
+		best_gap = 0.0
+		best_idx = 0
+		for i in range(1, len(s)):
+			gap = s[i] - s[i - 1]
+			if gap > best_gap:
+				best_gap = gap
+				best_idx = i
+		quality = best_gap / spread
+		if quality < 0.22:
+			return None, 0.0
+		threshold = (s[best_idx - 1] + s[best_idx]) / 2.0
+		return threshold, quality
+
+	def _recompute_threshold(self):
+		"""Recompute the dot/dash split and the dot-unit length.
+
+		The returned split is smoothed over time so the boundary doesn't
+		flap around.  The unit length (a dot) is the median of the durations
+		that fall below the split; it drives letter/word gap logic.
+		"""
+		if not self._duration_buf:
+			return None
+		thresh, _ = self._cluster_threshold(self._duration_buf)
+		if thresh is None:
+			# No convincing separation right now.  Keep any split we already
+			# learned this session so real dashes stay valuable, and keep the
+			# unit seeded from what we've actually heard (dots dominate, so
+			# the median is a good estimate of dot length).
+			self._unit_ms[0] = float(np.median(self._duration_buf))
+			return self._split_ms[0] or None
+		prev = self._split_smooth[0]
+		if prev is None:
+			prev = thresh
+		else:
+			prev = 0.7 * prev + 0.3 * thresh
+		self._split_smooth[0] = prev
+		self._split_ms[0] = prev
+		shorts = [d for d in self._duration_buf if d < prev]
+		if shorts:
+			self._unit_ms[0] = float(np.median(shorts))
+		else:
+			self._unit_ms[0] = prev / 2.5
+		return prev
+
+	# ---- Core processing loop ----
+
 	def _run(self):
-		import numpy as np
 		import time
 
 		noise_floor = self.min_amp
-		# Unit length (ms) used to tell dots and dashes apart; adapts to speed.
-		unit_length = 90.0
-		dot_times = []
 		key_active = False
 		confirm = 0
 		key_start_samples = 0
 		last_key_end_samples = None
 		offset = 0
+		tonal_chunks = 0
+		non_tonal_chunks = 0
+		tonal_win = self._tonal_samples
 
 		while self._running:
 			if not self._buffer:
@@ -353,23 +490,51 @@ class MorseListener:
 				continue
 
 			energy = float(np.sqrt(np.mean(np.array(block) ** 2)))
-			if energy < noise_floor:
-				noise_floor = max(self.min_amp, noise_floor * 0.9 + energy * 0.1)
-			threshold = max(self.min_amp, noise_floor * self.noise_factor)
 			now_samples = offset + self.chunk_size
 			offset = now_samples
 			stretch = self.slow_factor
+			unit = self._unit_ms[0] or 90.0
 
+			# --- Speech filtering via FFT tonality analysis ---
+			# Use a rolling ~90ms window so short dots still get enough
+			# samples for the frequency analysis to be meaningful.
+			tonal_win.extend(block)
+			if len(tonal_win) > 4000:
+				del tonal_win[:-3200]
+			is_tonal_chunk = self._is_tonal(tonal_win, self.sample_rate)
+			if energy > noise_floor * 1.2:
+				if is_tonal_chunk:
+					tonal_chunks += 1
+					non_tonal_chunks = max(0, non_tonal_chunks - 1)
+				else:
+					non_tonal_chunks += 1
+					tonal_chunks = max(0, tonal_chunks - 1)
+			total_chunks = tonal_chunks + non_tonal_chunks
+			if total_chunks >= self._tonal_confirm_needed:
+				tonal_ratio = tonal_chunks / total_chunks
+				if tonal_ratio < 0.45:
+					self._is_speech[0] = True
+				else:
+					self._is_speech[0] = False
+				# Decay counters to adapt to changing audio
+				tonal_chunks = int(tonal_chunks * 0.85)
+				non_tonal_chunks = int(non_tonal_chunks * 0.85)
+
+			# --- Noise floor tracking ---
+			if energy < noise_floor:
+				noise_floor = max(self.min_amp, noise_floor * 0.9 + energy * 0.1)
+			threshold = max(self.min_amp, noise_floor * self.noise_factor)
+
+			# --- Key on/off detection (skip if speech detected) ---
 			if not key_active:
 				if energy >= threshold:
 					confirm += 1
 					if confirm >= 2:
-						# A new word has begun: if the pause since the previous
-						# letter was a word gap, the space belongs here.
-						if self._pending_space[0]:
+						if (self._pending_space[0] and not self._is_speech[0]
+								and last_key_end_samples is not None):
 							gap_check = (
 								(now_samples - last_key_end_samples)
-								* 1000.0 / self.sample_rate * stretch / unit_length
+								* 1000.0 / self.sample_rate * stretch / unit
 							)
 							if gap_check >= 4.4:
 								self.out_queue.put(" ")
@@ -387,67 +552,117 @@ class MorseListener:
 						key_active = False
 						self._signal_active[0] = False
 						duration_ms = (now_samples - key_start_samples) * 1000.0 / self.sample_rate * stretch
+
+						if self._is_speech[0]:
+							# Reset partial code when speech ends
+							if self._partial[0]:
+								self._partial[0] = ""
+							last_key_end_samples = now_samples
+							continue
+
 						if last_key_end_samples is not None:
 							gap_ms = (key_start_samples - last_key_end_samples) * 1000.0 / self.sample_rate * stretch
 						else:
 							gap_ms = 0.0
 						last_key_end_samples = now_samples
-						self._classify(duration_ms, gap_ms, unit_length, dot_times)
-						# Re-estimate the unit length from recent dot durations.
-						if len(dot_times) >= 4:
-							fresh = dot_times[-8:]
-							unit_length = sorted(fresh)[len(fresh) // 2]
-							self._unit_ms[0] = unit_length
-					# else still keyed on; keep waiting
+						self._classify(duration_ms, gap_ms)
 				else:
 					confirm = 0
 
-			# Auto-commit the trailing letter after a quiet stretch so the
-			# final letter of a transmission doesn't hang waiting for a key.
-			# Only the letter is committed here; a word space is emitted by
-			# the next key-down handler if the pause turns out to be a word
-			# gap.  This keeps messages free of leading/trailing spaces.
-			if not key_active and last_key_end_samples is not None:
+			# Auto-commit trailing letter after quiet stretch
+			if not key_active and last_key_end_samples is not None and not self._is_speech[0]:
 				idle_units = (
 					(now_samples - last_key_end_samples)
-					* 1000.0 / self.sample_rate * stretch / unit_length
+					* 1000.0 / self.sample_rate * stretch / unit
 				)
-				if idle_units >= 2.4 and self._partial[0]:
-					self.out_queue.put(decode_obvious(self._partial[0]))
-					self._partial[0] = ""
-					self._pending_space[0] = True
+				if idle_units >= 2.4:
+					if self._pending:
+						# A short transmission has ended while still in
+						# warm-up; classify what we heard and release it.
+						for d, g in self._pending:
+							self._emit_signal(d, g, self._split_ms[0] or None)
+						self._pending = None
+					if self._partial[0]:
+						self.out_queue.put(decode_obvious(self._partial[0]))
+						self._partial[0] = ""
+						self._pending_space[0] = True
 
-	def _classify(self, duration_ms, gap_ms, unit_length, dot_times):
+	def _classify(self, duration_ms, gap_ms):
+		"""Classify a key press duration as dot or dash using relative comparison.
+
+		During warm-up the first few signals are held back and classified
+		retroactively once the durations can be compared to each other, so
+		the very first dash+dot pair is already told apart.  After that each
+		signal streams immediately through the learned split point.  The
+		learned dot-unit also drives the gap logic that splits letters and
+		words, so everything scales with the sender's speed.
+		"""
 		if duration_ms <= 0:
 			return
-		# A dash is roughly 3 units; a dot is 1 unit.  Anything much longer
-		# than a dash is treated as noise / a stuck key.
-		if duration_ms >= unit_length * 2.2:
+
+		# Keep the recent durations; the split is re-learned from this window.
+		self._duration_buf.append(duration_ms)
+		if len(self._duration_buf) > self._duration_buf_max:
+			self._duration_buf = self._duration_buf[-self._duration_buf_max:]
+		split = self._recompute_threshold()
+
+		if self._pending is not None:
+			# Warm-up: buffer until we can compare these signals to each other.
+			self._pending.append((duration_ms, gap_ms))
+			need_split = split is not None and len(self._pending) >= 2
+			need_more = len(self._pending) >= self._warmup_min
+			if not (need_split or need_more):
+				return
+			for d, g in self._pending:
+				self._emit_signal(d, g, split)
+			self._pending = None
+			return
+
+		self._emit_signal(duration_ms, gap_ms, split)
+
+	def _emit_signal(self, duration_ms, gap_ms, split):
+		"""Turn one measured press into a dot/dash and fold it into a letter."""
+		if duration_ms <= 0:
+			return
+
+		if split is not None:
+			# Relative comparison against the learned boundary.
+			dash = duration_ms >= split
+		else:
+			# No learned split yet (e.g. everything so far is a similar
+			# length): dots dominate in Morse, so only treat clearly-long
+			# presses as dashes.
+			unit = self._unit_ms[0] or 90.0
+			dash = duration_ms >= unit * 2.2
+
+		if dash:
 			signal = "-"
 			self._last_dash_ms[0] = duration_ms
-		elif duration_ms >= unit_length * 0.5:
-			signal = "."
-			dot_times.append(duration_ms)
-			self._last_dot_ms[0] = duration_ms
 		else:
-			return
+			signal = "."
+			self._last_dot_ms[0] = duration_ms
 		self._last_gap_ms[0] = gap_ms
 
-		# The gap sits BETWEEN the previous key and this one, so it only
-		# closes the letter/word that came before — never the one starting now.
+		# Gap-based letter/word splitting, scaled by the learned dot-unit.
+		unit = self._unit_ms[0] or 90.0
 		previous = self._partial[0]
 		if previous:
-			if gap_ms >= unit_length * 4.4:
+			if gap_ms >= unit * 4.4:
 				self.out_queue.put(decode_obvious(previous))
 				self.out_queue.put(" ")
 				self._partial[0] = ""
-			elif gap_ms >= unit_length * 2.2:
+			elif gap_ms >= unit * 2.2:
 				self.out_queue.put(decode_obvious(previous))
 				self._partial[0] = ""
 		self._partial[0] = self._partial[0] + signal
 
 	def flush(self):
-		"""Commit the current partial letter without adding a trailing space."""
+		"""Commit the current partial letter without adding a trailing space.
+		Also flushes any signal still waiting in the warm-up buffer."""
+		if self._pending:
+			for d, g in self._pending:
+				self._emit_signal(d, g, self._split_ms[0] or None)
+			self._pending = None
 		if self._partial[0]:
 			self.out_queue.put(decode_obvious(self._partial[0]))
 			self._partial[0] = ""
@@ -946,10 +1161,20 @@ def run_machine():
 			instructions = "Press . for a dot  |  Press - for a dash"
 		screen.blit(font.render(instructions, True, text_color), (58, 140))
 		if mode == "Record Mode":
+			if listener.is_speech:
+				mic_status = "SPEECH DETECTED - IGNORING"
+			elif listener.signal_active:
+				mic_status = "TONE"
+			else:
+				mic_status = "LISTENING"
 			screen.blit(font.render(
-				f"SLOW ×{listener.slow_factor:g}  ·  dot {listener.dot_ms:.0f}ms  ·  dash {listener.dash_ms:.0f}ms  ·  gap {listener.gap_ms:.0f}ms",
+				f"SLOW ×{listener.slow_factor:g}  ·  {mic_status}  ·  dot {listener.dot_ms:.0f}ms  ·  dash {listener.dash_ms:.0f}ms",
 				True, muted_text,
 			), (58, 174))
+			screen.blit(font.render(
+				f"gap {listener.gap_ms:.0f}ms  ·  unit {listener.unit_ms:.0f}ms  ·  split {listener._split_ms[0]:.0f}ms",
+				True, muted_text,
+			), (58, 174 + 26))
 		else:
 			screen.blit(font.render(f"Pause {letter_gap}ms for the next letter  |  {word_gap}ms for a space", True, muted_text), (58, 174))
 
