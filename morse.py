@@ -1,3 +1,11 @@
+import json
+import os
+import queue
+import socket
+import threading
+import urllib.parse
+import urllib.request
+
 import numpy as np
 from functools import lru_cache
 
@@ -56,6 +64,59 @@ for _rank, _word in enumerate(_COMMON_WORDS):
 	_word_code = "".join(MORSE_CODE[character] for character in _word)
 	if _word_code not in _WORD_BY_MORSE:
 		_WORD_BY_MORSE[_word_code] = (_rank, _word)
+
+
+CHAT_LANGUAGES = (
+	("en", "English"), ("es", "Spanish"), ("pt", "Portuguese"), ("fr", "French"),
+	("de", "German"), ("it", "Italian"), ("nl", "Dutch"), ("pl", "Polish"),
+	("ru", "Russian"), ("uk", "Ukrainian"), ("sv", "Swedish"), ("tr", "Turkish"),
+	("ar", "Arabic"), ("hi", "Hindi"), ("zh-CN", "Chinese"), ("ja", "Japanese"),
+	("ko", "Korean"),
+)
+
+LANGUAGE_BY_CODE = dict(CHAT_LANGUAGES)
+
+DEFAULT_CHAT_HOST = "127.0.0.1"
+DEFAULT_CHAT_PORT = 8765
+DEFAULT_CHAT_NICK = os.environ.get("USER") or os.environ.get("USERNAME") or "Operator"
+
+_TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+
+
+@lru_cache(maxsize=4096)
+def _translate_cached(text, target, source):
+	"""Hit the public Google endpoint; raises on failure so failed
+	attempts are never cached and get retried later."""
+	query = urllib.parse.urlencode(
+		{"client": "gtx", "sl": source, "tl": target, "dt": "t", "q": text}
+	)
+	request = urllib.request.Request(
+		_TRANSLATE_ENDPOINT + "?" + query,
+		headers={
+			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+			"Referer": "https://translate.google.com/",
+		},
+	)
+	with urllib.request.urlopen(request, timeout=6) as response:
+		payload = json.loads(response.read().decode("utf-8"))
+	joined = "".join(part[0] for part in payload[0] if part and part[0])
+	if not joined:
+		raise RuntimeError("empty translation")
+	return joined
+
+
+def google_translate(text, target, source="auto"):
+	"""Translate *text* to *target* via the public Google endpoint.
+
+	Returns *text* unchanged if the network is unavailable or the request
+	fails, so the chat can never be blocked on translation.
+	"""
+	if not text or not target:
+		return text
+	try:
+		return _translate_cached(text, target, source)
+	except Exception:
+		return text
 
 
 def encode(text):
@@ -668,8 +729,168 @@ class MorseListener:
 			self._partial[0] = ""
 
 
-def run_machine():
+class _Translator:
+	"""Background worker that translates incoming chat messages, so the
+	pygame loop is never blocked by a network call to Google."""
+
+	def __init__(self):
+		self._jobs = queue.Queue()
+		self._thread = threading.Thread(daemon=True, name="chat-translator", target=self._run)
+		self._thread.start()
+
+	def submit(self, callback, text, target):
+		self._jobs.put((callback, text, target))
+
+	def _run(self):
+		while True:
+			callback, text, target = self._jobs.get()
+			if not text or not target:
+				callback(text)
+				continue
+			callback(google_translate(text, target))
+
+
+class MorseChatClient:
+	"""Non-blocking TCP client for the international Morse chat server."""
+
+	def __init__(self, host, port, nick, lang="en"):
+		self.host = host
+		self.port = port
+		self.nick = nick
+		self.lang = lang
+		self.sock = None
+		self._running = False
+		self._thread = None
+		self._read_buffer = b""
+		self._send_lock = threading.Lock()
+		self.inbox = queue.Queue()
+		self.outbox = queue.Queue()
+		self.connected = False
+		self.status_text = "disconnected"
+		self.country = ""
+		self.country_code = "--"
+		self.city = ""
+		self.users = []
+
+	def start(self):
+		if self._thread is not None and self._thread.is_alive():
+			return
+		self._running = True
+		self._thread = threading.Thread(daemon=True, name="morse-chat-client", target=self._run)
+		self._thread.start()
+
+	def _run(self):
+		self.connected = False
+		self.status_text = "connecting"
+		sock = None
+		error = None
+		try:
+			sock = socket.create_connection((self.host, self.port), timeout=8)
+			sock.settimeout(0.25)
+			self.sock = sock
+			self.status_text = "handshake"
+			self._send({"type": "join", "nick": self.nick, "lang": self.lang})
+			while self._running:
+				while not self.outbox.empty():
+					self._send(self.outbox.get_nowait())
+				try:
+					chunk = sock.recv(4096)
+				except socket.timeout:
+					continue
+				if not chunk:
+					break
+				self._read_buffer += chunk
+				while b"\n" in self._read_buffer:
+					line, _, self._read_buffer = self._read_buffer.partition(b"\n")
+					self._handle_line(line.decode("utf-8", "replace"))
+		except OSError as exc:
+			error = str(exc)
+		finally:
+			self.connected = False
+			self.status_text = f"error: {error}" if error and self._running else "disconnected"
+			try:
+				if sock is not None:
+					sock.close()
+			except OSError:
+				pass
+			self.sock = None
+
+	def _send(self, packet):
+		if self.sock is None:
+			return
+		data = (json.dumps(packet, ensure_ascii=False) + "\n").encode("utf-8")
+		with self._send_lock:
+			try:
+				self.sock.sendall(data)
+			except OSError:
+				pass
+
+	def send_chat(self, text, morse=None):
+		self.outbox.put({"type": "chat", "text": text, "morse": morse or None})
+
+	def _handle_line(self, line):
+		try:
+			msg = json.loads(line)
+		except ValueError:
+			return
+		msg_type = msg.get("type")
+		if msg_type == "welcome":
+			self.connected = True
+			self.status_text = "connected"
+			self.country = msg.get("country", "")
+			self.country_code = msg.get("countryCode", "--")
+			self.city = msg.get("city", "")
+			self.users = msg.get("users", [])
+		elif msg_type == "join":
+			self.users.append({
+				"nick": msg.get("nick", "?"),
+				"country": msg.get("country", ""),
+				"code": msg.get("countryCode", "--"),
+			})
+			self.inbox.put(msg)
+		elif msg_type == "leave":
+			self.users = [user for user in self.users if user.get("nick") != msg.get("nick")]
+			self.inbox.put(msg)
+		elif msg_type == "chat":
+			self.inbox.put(msg)
+
+	def disconnect(self):
+		self._running = False
+		try:
+			if self.sock is not None:
+				self.sock.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+		try:
+			if self.sock is not None:
+				self.sock.close()
+		except OSError:
+			pass
+		if self._thread is not None:
+			self._thread.join(timeout=2)
+		self._thread = None
+		self.sock = None
+		self.connected = False
+		self.status_text = "disconnected"
+
+
+def run_machine(config=None):
 	"""Run a pygame Morse keyer controlled by the space bar."""
+	cfg = config or {}
+	chat_host = str(cfg.get("server") or DEFAULT_CHAT_HOST)
+	chat_port = int(cfg.get("port") or DEFAULT_CHAT_PORT)
+	chat_nick = str(cfg.get("nick") or DEFAULT_CHAT_NICK).strip()[:24] or "Operator"
+	chat_display_lang = str(cfg.get("lang") or "en")
+	if chat_display_lang not in LANGUAGE_BY_CODE:
+		chat_display_lang = "en"
+	auto_connect = bool(cfg.get("connect"))
+	chat_client = None
+	chat_translator = None
+	chat_log = []
+	chat_input = ""
+	chat_mode = "normal"
+	chat_lang_open = False
+	chat_lang_scroll = 0
 	import array
 	import math
 	import pygame
@@ -702,7 +923,7 @@ def run_machine():
 	checker_interval = 10
 	letter_gap = 700
 	word_gap = 1400
-	mode_options = ("Duration Mode", "Dot Stream Mode", "Keyboard Buttons", "Translator Mode", "Record Mode")
+	mode_options = ("Duration Mode", "Dot Stream Mode", "Keyboard Buttons", "Translator Mode", "Record Mode", "International Chat")
 	mode = mode_options[0]
 	dropdown_open = False
 	speed_dropdown_open = False
@@ -726,6 +947,24 @@ def run_machine():
 	record_slow_options = (1.0, 2.0, 3.0, 4.0)
 	record_slow_index = 0
 	listener = MorseListener()
+
+	chat_mode_rect = pygame.Rect(455, 270, 245, 52)
+	chat_lang_rect = pygame.Rect(710, 270, 175, 52)
+	chat_status_rect = pygame.Rect(895, 270, 230, 52)
+
+	def load_chat_font(size):
+		for path in (
+			"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+			"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+		):
+			if os.path.exists(path):
+				try:
+					return pygame.font.Font(path, size)
+				except Exception:
+					pass
+		return pygame.font.Font(None, size)
+
+	chat_font = load_chat_font(30)
 
 	def make_tone(duration_ms):
 		sample_rate = 44100
@@ -816,7 +1055,7 @@ def run_machine():
 		last_signal = signal_time
 
 	def select_mode(selected_mode):
-		nonlocal mode, current_code, press_started, last_dot, dot_emitted, last_signal
+		nonlocal mode, current_code, press_started, last_dot, dot_emitted, last_signal, chat_client
 		if mode == "Record Mode":
 			listener.flush()
 			listener.stop()
@@ -828,6 +1067,10 @@ def run_machine():
 		last_signal = None
 		if mode == "Translator Mode":
 			pygame.key.start_text_input()
+		elif mode == "International Chat":
+			pygame.key.start_text_input()
+			if chat_client is None:
+				start_chat()
 		elif mode == "Record Mode":
 			pygame.key.stop_text_input()
 			try:
@@ -1038,13 +1281,266 @@ def run_machine():
 		except Exception:
 			pass
 
+	def start_chat():
+		nonlocal chat_client, chat_translator
+		if chat_client is not None:
+			chat_client.disconnect()
+		chat_client = MorseChatClient(chat_host, chat_port, chat_nick, lang=chat_display_lang)
+		chat_client.start()
+		if chat_translator is None:
+			chat_translator = _Translator()
+
+	def toggle_chat():
+		nonlocal chat_client
+		if chat_client is not None and chat_client.connected:
+			chat_client.disconnect()
+			chat_client = None
+		else:
+			start_chat()
+
+	def wrap_chat(text):
+		lines = []
+		current = ""
+		for word in str(text).split():
+			candidate = f"{current} {word}".strip()
+			if chat_font.size(candidate)[0] <= 1080:
+				current = candidate
+				continue
+			if current:
+				lines.append(current)
+			current = word
+		if current:
+			lines.append(current)
+		return lines or [" "]
+
+	def submit_translation(entry, text, morse):
+		if chat_translator is None or not text:
+			return
+
+		def apply(translated):
+			if morse:
+				entry["lines"] = wrap_chat(morse)
+				entry["note"] = "-> " + translated
+			else:
+				entry["lines"] = wrap_chat(translated)
+
+		chat_translator.submit(apply, text, chat_display_lang)
+
+	def same_lang_prefix(first, second):
+		return (first or "").lower().split("-")[0] == (second or "").lower().split("-")[0]
+
+	def add_chat_message(msg):
+		nonlocal chat_log
+		msg_type = msg.get("type")
+		if msg_type == "join":
+			chat_log.append({"kind": "system", "lines": [f"+ {msg.get('nick', '?')} joined from {msg.get('country', '?')}"]})
+		elif msg_type == "leave":
+			chat_log.append({"kind": "system", "lines": [f"- {msg.get('nick', '?')} left"]})
+		elif msg_type == "chat":
+			text = msg.get("text") or ""
+			morse = msg.get("morse") or ""
+			nick = msg.get("nick") or "?"
+			country = msg.get("country") or msg.get("countryCode") or ""
+			if morse:
+				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(morse)}
+				chat_log.append(entry)
+				submit_translation(entry, text, True)
+			elif text:
+				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text)}
+				chat_log.append(entry)
+				if not same_lang_prefix(msg.get("lang"), chat_display_lang):
+					submit_translation(entry, text, False)
+		if len(chat_log) > 300:
+			del chat_log[:50]
+
+	def encode_words_to_morse(text):
+		words = []
+		for word in text.split():
+			cleaned = "".join(character for character in word.upper() if character in MORSE_CODE)
+			if cleaned:
+				words.append(" ".join(MORSE_CODE[character] for character in cleaned))
+		return " / ".join(words) if words else None
+
+	def decode_morse_entry(buffer):
+		decoded = []
+		for word in buffer.strip().split(" / "):
+			letters = [letter for letter in word.split() if letter]
+			if letters:
+				decoded.append("".join(_CHARACTER_BY_CODE.get(letter, "?") for letter in letters))
+		return " ".join(decoded)
+
+	def morse_space():
+		nonlocal chat_input
+		if not chat_input or chat_input.rstrip().endswith("/"):
+			return
+		if chat_input.endswith(" "):
+			chat_input = chat_input.rstrip() + " / "
+		else:
+			chat_input += " "
+
+	def morse_slash():
+		nonlocal chat_input
+		if not chat_input or chat_input.rstrip().endswith("/"):
+			return
+		chat_input = chat_input.rstrip() + " / "
+
+	def send_chat_message():
+		nonlocal chat_input
+		text = chat_input.strip()
+		morse = None
+		if chat_mode == "morse_to_word":
+			morse = text or None
+			text = decode_morse_entry(morse) or text
+		elif chat_mode == "words_to_morse":
+			morse = encode_words_to_morse(text)
+		if not text:
+			return
+		if chat_client is None or not chat_client.connected:
+			return
+		chat_client.send_chat(text, morse)
+		add_chat_message({
+			"type": "chat",
+			"nick": chat_nick,
+			"country": chat_client.country,
+			"lang": chat_display_lang,
+			"text": text,
+			"morse": morse,
+		})
+		chat_input = ""
+
+	def draw_chat_screen(now):
+		nonlocal chat_lang_scroll
+		screen.fill(background)
+		pygame.draw.rect(screen, (15, 30, 40), (0, 0, 1200, 180))
+		screen.blit(title_font.render("INTERNATIONAL CHAT", True, text_color), (55, 38))
+		screen.blit(font.render("Talk to the world — or send the whole message in Morse", True, accent), (58, 105))
+
+		connected = chat_client is not None and chat_client.connected
+		if connected:
+			place = chat_client.country or chat_client.country_code or "?"
+			status = f"CONNECTED · YOU: {chat_nick} · {place}"
+			status_color = accent
+		elif chat_client is not None and chat_client.status_text == "connecting":
+			status = "CONNECTING..."
+			status_color = (242, 186, 73)
+		elif chat_client is not None and chat_client.status_text:
+			status = chat_client.status_text.upper()
+			status_color = muted_text
+		else:
+			status = "DISCONNECTED"
+			status_color = muted_text
+		screen.blit(font.render(status, True, status_color), (58, 140))
+		if chat_client is not None:
+			online_names = ", ".join(user.get("nick", "?") for user in chat_client.users)
+			online = f"{len(chat_client.users)} ONLINE: {online_names}"
+		else:
+			online = "0 ONLINE"
+		screen.blit(font.render(online, True, muted_text), (58, 174))
+
+		pygame.draw.rect(screen, panel, (35, 215, 1130, 145), border_radius=12)
+		screen.blit(label_font.render("OPTIONS", True, accent), (55, 232))
+		mode_label = {
+			"normal": "TEXT",
+			"morse_to_word": "MORSE>WORD",
+			"words_to_morse": "WORDS>MORSE",
+		}[chat_mode]
+		mode_active = chat_mode != "normal"
+		pygame.draw.rect(screen, accent_soft if mode_active else panel_highlight, chat_mode_rect, border_radius=8)
+		screen.blit(chat_font.render("CHAT MODE", True, text_color), (chat_mode_rect.x + 12, chat_mode_rect.y + 6))
+		screen.blit(chat_font.render(mode_label, True, dash_color if mode_active else muted_text), (chat_mode_rect.x + 12, chat_mode_rect.y + 32))
+		pygame.draw.rect(screen, panel_highlight, chat_lang_rect, border_radius=8)
+		lang_name = LANGUAGE_BY_CODE.get(chat_display_lang, chat_display_lang)
+		screen.blit(chat_font.render(f"LANG: {lang_name}", True, text_color), (chat_lang_rect.x + 12, chat_lang_rect.y + 14))
+		pygame.draw.rect(screen, panel_highlight if connected else accent_soft, chat_status_rect, border_radius=8)
+		screen.blit(chat_font.render("DISCONNECT" if connected else "CONNECT", True, text_color), (chat_status_rect.x + 12, chat_status_rect.y + 14))
+
+		log_rect = pygame.Rect(35, 390, 1130, 235)
+		pygame.draw.rect(screen, panel, log_rect, border_radius=12)
+		rows = []
+		for entry in chat_log:
+			if entry["kind"] == "system":
+				for line in entry["lines"]:
+					rows.append((line, muted_text))
+				continue
+			header = entry["nick"]
+			if entry.get("country"):
+				header += f"  [{entry['country']}]"
+			rows.append((header, accent))
+			for line in entry["lines"]:
+				rows.append((line, text_color))
+			if entry.get("note"):
+				rows.append((entry["note"], muted_text))
+		line_height = chat_font.get_linesize() + 2
+		max_rows = (log_rect.height - 20) // line_height
+		visible = rows[-max_rows:]
+		row_y = log_rect.y + 10
+		for text, color in visible:
+			screen.blit(chat_font.render(text, True, color), (log_rect.x + 14, row_y))
+			row_y += line_height
+		if not chat_log:
+			hint = "Connect and start typing…"
+			screen.blit(chat_font.render(hint, True, muted_text), (log_rect.x + 14, log_rect.y + 12))
+
+		input_rect = pygame.Rect(35, 634, 1130, 82)
+		pygame.draw.rect(screen, panel_highlight, input_rect, border_radius=10)
+		caret = "|" if now // 500 % 2 == 0 else " "
+		if chat_mode == "morse_to_word":
+			prefix = "MORSE>WORD:"
+			prefix_surface = chat_font.render(prefix, True, dash_color)
+			screen.blit(prefix_surface, (input_rect.x + 14, input_rect.y + 10))
+			value = (chat_input + caret) if chat_input else caret
+			screen.blit(chat_font.render(value, True, text_color), (input_rect.x + 14 + prefix_surface.get_width(), input_rect.y + 10))
+			preview = "-> " + (decode_morse_entry(chat_input) if chat_input else "press . - space / to type morse, Enter to send")
+			screen.blit(chat_font.render(preview, True, muted_text), (input_rect.x + 14, input_rect.y + 48))
+		else:
+			prefix = "WORDS>MORSE:" if chat_mode == "words_to_morse" else "TEXT:"
+			prefix_surface = chat_font.render(prefix, True, dash_color if chat_mode == "words_to_morse" else accent)
+			screen.blit(prefix_surface, (input_rect.x + 14, input_rect.y + 20))
+			value = (chat_input + caret) if chat_input else caret
+			screen.blit(chat_font.render(value, True, text_color), (input_rect.x + 14 + prefix_surface.get_width(), input_rect.y + 20))
+
+		if chat_lang_open:
+			visible = max(1, (720 - (chat_lang_rect.y + 52)) // 34)
+			max_scroll = max(0, len(CHAT_LANGUAGES) - visible)
+			chat_lang_scroll = min(max_scroll, max(0, chat_lang_scroll))
+			for index in range(chat_lang_scroll, min(len(CHAT_LANGUAGES), chat_lang_scroll + visible)):
+				code, name = CHAT_LANGUAGES[index]
+				option_rect = pygame.Rect(chat_lang_rect.x, chat_lang_rect.y + 52 + (index - chat_lang_scroll) * 34, chat_lang_rect.width, 34)
+				pygame.draw.rect(screen, panel_highlight, option_rect, border_radius=6)
+				pygame.draw.rect(screen, accent_soft, option_rect, width=1, border_radius=6)
+				marker = " *" if code == chat_display_lang else ""
+				screen.blit(chat_font.render(name + marker, True, text_color), (option_rect.x + 8, option_rect.y + 6))
+
+	if auto_connect:
+		select_mode("International Chat")
+
 	while running:
 		now = pygame.time.get_ticks()
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				running = False
 			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-				if mode == "Translator Mode" and sound_button_rect.collidepoint(event.pos):
+				if mode == "International Chat" and chat_status_rect.collidepoint(event.pos):
+					toggle_chat()
+				elif mode == "International Chat" and chat_mode_rect.collidepoint(event.pos):
+					_chat_order = ("normal", "morse_to_word", "words_to_morse")
+					chat_mode = _chat_order[(_chat_order.index(chat_mode) + 1) % len(_chat_order)]
+					chat_lang_open = False
+				elif mode == "International Chat" and chat_lang_rect.collidepoint(event.pos):
+					chat_lang_open = not chat_lang_open
+					if chat_lang_open:
+						_selected = next((_i for _i, (_code, _name) in enumerate(CHAT_LANGUAGES) if _code == chat_display_lang), 0)
+						_visible = max(1, (720 - (chat_lang_rect.y + 52)) // 34)
+						chat_lang_scroll = min(max(0, _selected - _visible // 2), max(0, len(CHAT_LANGUAGES) - _visible))
+				elif mode == "International Chat" and chat_lang_open:
+					_visible = max(1, (720 - (chat_lang_rect.y + 52)) // 34)
+					for _index in range(chat_lang_scroll, min(len(CHAT_LANGUAGES), chat_lang_scroll + _visible)):
+						_code, _name = CHAT_LANGUAGES[_index]
+						_option_rect = pygame.Rect(chat_lang_rect.x, chat_lang_rect.y + 52 + (_index - chat_lang_scroll) * 34, chat_lang_rect.width, 34)
+						if _option_rect.collidepoint(event.pos):
+							chat_display_lang = _code
+							chat_lang_open = False
+				elif mode == "Translator Mode" and sound_button_rect.collidepoint(event.pos):
 					play_current()
 				elif mode == "Translator Mode" and speed_button_rect.collidepoint(event.pos):
 					speed_dropdown_open = not speed_dropdown_open
@@ -1069,6 +1565,11 @@ def run_machine():
 							press_started = None
 							last_dot = None
 							dot_emitted = False
+			elif event.type == pygame.MOUSEWHEEL:
+				if mode == "International Chat" and chat_lang_open:
+					_visible = max(1, (720 - (chat_lang_rect.y + 52)) // 34)
+					_max_scroll = max(0, len(CHAT_LANGUAGES) - _visible)
+					chat_lang_scroll = min(_max_scroll, max(0, chat_lang_scroll - event.y))
 			elif event.type == pygame.KEYDOWN:
 				if event.key == pygame.K_ESCAPE:
 					running = False
@@ -1082,6 +1583,25 @@ def run_machine():
 					translator_text = ""
 				elif event.key == pygame.K_TAB:
 					show_help()
+				elif mode == "International Chat" and chat_mode == "morse_to_word":
+					if event.key in (pygame.K_PERIOD, pygame.K_MINUS):
+						chat_input += "." if event.key == pygame.K_PERIOD else "-"
+					elif event.key == pygame.K_SPACE:
+						morse_space()
+					elif event.key == pygame.K_SLASH:
+						morse_slash()
+					elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+						send_chat_message()
+					elif event.key == pygame.K_BACKSPACE:
+						chat_input = chat_input[:-1]
+					elif event.key == pygame.K_DELETE:
+						chat_input = ""
+				elif mode == "International Chat" and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+					send_chat_message()
+				elif mode == "International Chat" and event.key == pygame.K_BACKSPACE:
+					chat_input = chat_input[:-1]
+				elif mode == "International Chat" and event.key == pygame.K_DELETE:
+					chat_input = ""
 				elif event.key == pygame.K_DELETE:
 					message = message.rstrip()
 					message = message[:-1]
@@ -1106,13 +1626,16 @@ def run_machine():
 					signal = "." if event.key == pygame.K_PERIOD else "-"
 					record_signal(signal, now)
 					play_signal(signal)
-				elif mode not in ("Keyboard Buttons", "Translator Mode") and event.key == pygame.K_SPACE and press_started is None:
+				elif mode not in ("Keyboard Buttons", "Translator Mode", "International Chat") and event.key == pygame.K_SPACE and press_started is None:
 					press_started = now
 					last_dot = now
 					dot_emitted = False
-			elif event.type == pygame.TEXTINPUT and mode == "Translator Mode":
-				translator_text += event.text
-			elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and mode != "Translator Mode":
+			elif event.type == pygame.TEXTINPUT:
+				if mode == "Translator Mode":
+					translator_text += event.text
+				elif mode == "International Chat" and chat_mode != "morse_to_word":
+					chat_input += event.text
+			elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and mode not in ("Translator Mode", "International Chat"):
 				if press_started is not None:
 					if mode == "Duration Mode":
 						signal = "-" if now - press_started >= dash_threshold else "."
@@ -1141,9 +1664,20 @@ def run_machine():
 				else:
 					message += decoded
 
+		if mode == "International Chat" and chat_client is not None:
+			while not chat_client.inbox.empty():
+				add_chat_message(chat_client.inbox.get())
+
 		while now - last_check >= checker_interval:
 			last_check += checker_interval
 			check_pattern(last_check)
+
+		if mode == "International Chat":
+			draw_chat_screen(now)
+			pygame.display.flip()
+			update_help()
+			clock.tick(120)
+			continue
 
 		screen.fill(background)
 		pygame.draw.rect(screen, (15, 30, 40), (0, 0, 1200, 180))
@@ -1261,9 +1795,26 @@ def run_machine():
 
 	if help_root is not None:
 		help_root.destroy()
+	if chat_client is not None:
+		chat_client.disconnect()
 	listener.stop()
 	pygame.quit()
 
 
 if __name__ == "__main__":
-	run_machine()
+	import argparse
+
+	parser = argparse.ArgumentParser(description="Morse Machine — international Morse chat")
+	parser.add_argument("--server", default=DEFAULT_CHAT_HOST, help="international chat server host")
+	parser.add_argument("--port", type=int, default=DEFAULT_CHAT_PORT, help="international chat server port")
+	parser.add_argument("--nick", default=DEFAULT_CHAT_NICK, help="your display name in the chat")
+	parser.add_argument("--lang", default="en", help="your chat display language (ISO code, e.g. pt, es, fr)")
+	parser.add_argument("--connect", action="store_true", help="open directly on International Chat")
+	args = parser.parse_args()
+	run_machine({
+		"server": args.server,
+		"port": args.port,
+		"nick": args.nick,
+		"lang": args.lang,
+		"connect": args.connect,
+	})
