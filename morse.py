@@ -65,6 +65,19 @@ for _rank, _word in enumerate(_COMMON_WORDS):
 	if _word_code not in _WORD_BY_MORSE:
 		_WORD_BY_MORSE[_word_code] = (_rank, _word)
 
+_WORD_RANK = {word: rank for rank, word in enumerate(_COMMON_WORDS)}
+
+# Words indexed by every letter prefix (e.g. "HE" + L -> HELLO, HELP ...) so
+# word prediction can match on real letter sequences instead of hunches from
+# the merged dot/dash run.  This is built straight from the word list so a
+# word whose code collides with another (e.g. HE vs IS both look like
+# "....." when merged) is never lost.  Each prefix holds words sorted by
+# how common they are.
+_WORDS_BY_LETTER_PREFIX = {}
+for _word, _rank in sorted(_WORD_RANK.items(), key=lambda _entry: _entry[1]):
+	for _index in range(1, len(_word) + 1):
+		_WORDS_BY_LETTER_PREFIX.setdefault(_word[:_index], []).append(_word)
+
 
 CHAT_LANGUAGES = (
 	("en", "English"), ("es", "Spanish"), ("pt", "Portuguese"), ("fr", "French"),
@@ -129,8 +142,18 @@ def encode(text):
 
 
 def decode_obvious(morse):
-	"""Choose the most likely word or letter split for a Morse run."""
-	code = "".join(morse.split())
+	"""Choose the most likely word or letter split for a Morse run.
+
+	Spaces separate letters, so ``".... ."`` is treated as two letters
+	("HE") rather than being silently joined into one run ("....." = 5).
+	A complete letter or known word always wins over an invented split.
+	"""
+	if not morse or not morse.strip():
+		return ""
+	runs = morse.strip().split()
+	if len(runs) > 1:
+		return "".join(decode_obvious(run) for run in runs)
+	code = runs[0]
 	if code in _CHARACTER_BY_CODE:
 		return _CHARACTER_BY_CODE[code]
 	if code in _WORD_BY_MORSE:
@@ -205,14 +228,19 @@ def decode_timed(signals, letter_pause=420, word_pause=1000):
 
 
 def predict_letters(morse, limit=8):
-	"""Return likely letters whose reference-tree paths match a Morse prefix."""
+	"""Return likely characters whose reference-tree paths match a Morse prefix.
+
+	The closest exact match (a complete character) is listed first, then the
+	letters that continue the same path.  Numbers are included so a finished
+	digit run (e.g. ``"....-"`` = 4) still gets a sensible answer.
+	"""
 	prefix = "".join(morse.split())
 	if not prefix:
 		return ("E", "T")
 	candidates = [
 		(character, code)
 		for character, code in MORSE_CODE.items()
-		if character.isalpha() and code.startswith(prefix)
+		if code.startswith(prefix)
 	]
 	candidates.sort(
 		key=lambda item: (
@@ -224,22 +252,70 @@ def predict_letters(morse, limit=8):
 
 
 @lru_cache(maxsize=None)
-def _predict_words(prefix):
-	"""Predict the word being formed from a dot/dash run prefix.
+def _complete_letters_in_run(code):
+	"""Return every letter sequence that fully consumes a dot/dash run."""
+	if not code:
+		return ("",)
+	results = set()
+	for morse_code, character in _CHARACTER_BY_CODE.items():
+		if not character.isalpha() or not code.startswith(morse_code):
+			continue
+		for rest in _complete_letters_in_run(code[len(morse_code):]):
+			results.add(character + rest)
+	return tuple(sorted(results))
 
-	Uses the same vocabulary as the other modes (``_WORD_BY_MORSE``) and
-	returns the most common words whose full Morse run begins with what has
-	been heard so far.
+
+@lru_cache(maxsize=None)
+def _predict_words(prefix, context=""):
+	"""Predict the word the user is spelling from a dot/dash run prefix.
+
+	*prefix* is the Morse for the *current* letter being pressed and
+	*context* is the part of the current word already committed (``""`` for
+	a fresh word).  Only words whose actual letter sequence starts with the
+	context followed by a letter matching the run are suggested, so a run
+	never cuts across a letter boundary (``... `` can suggest S/H/V words
+	but never ``IS``, which starts with I = ``..``).
+
+	Words whose current letter is already complete win over partial-letter
+	guesses, and equally-likely words are ordered by how common they are.
 	"""
+	prefix = "".join(prefix.split())
 	if not prefix:
 		return ()
-	matches = [
-		(rank, word)
-		for code, (rank, word) in _WORD_BY_MORSE.items()
-		if code.startswith(prefix)
-	]
-	matches.sort(key=lambda item: (item[0], item[1]))
-	return tuple(word for _, word in matches[:4])
+	if not isinstance(context, str) or not context.isalpha():
+		context = ""
+	else:
+		context = context.upper()
+
+	candidates = {}
+
+	def _consider(base, partial):
+		for word in _WORDS_BY_LETTER_PREFIX.get(base, ()):
+			quality = (partial, _WORD_RANK[word])
+			if word not in candidates or quality < candidates[word]:
+				candidates[word] = quality
+
+	# Primary interpretation: the run is (part of) one current letter.
+	for character in _CHARACTER_BY_CODE.values():
+		if not character.isalpha():
+			continue
+		code = MORSE_CODE[character]
+		if code.startswith(prefix):
+			_consider(context + character, partial=code != prefix)
+
+	# Fallback: the run could not be (part of) a single character at all,
+	# so treat it as one or more complete letters.  A finished number like
+	# 5 = "....." is a valid single character, so it is kept out of the
+	# word suggestions and the caller falls back to letter prediction.
+	if not candidates and not any(
+		code.startswith(prefix) for code in MORSE_CODE.values()
+	):
+		for completed in _complete_letters_in_run(prefix):
+			if completed:
+				_consider(context + completed, partial=1)
+
+	ordered = sorted(candidates.items(), key=lambda item: (item[1], item[0]))
+	return tuple(word for word, _ in ordered[:4])
 
 
 def decode(morse):
@@ -1366,7 +1442,10 @@ def run_machine(config=None):
 		for word in buffer.strip().split(" / "):
 			letters = [letter for letter in word.split() if letter]
 			if letters:
-				decoded.append("".join(_CHARACTER_BY_CODE.get(letter, "?") for letter in letters))
+				decoded.append("".join(
+					_CHARACTER_BY_CODE.get(letter) or decode_obvious(letter)
+					for letter in letters
+				))
 		return " ".join(decoded)
 
 	def morse_space():
@@ -1745,30 +1824,34 @@ def run_machine(config=None):
 		if mode == "Translator Mode":
 			draw_translation(translator_text, pygame.Rect(625, 462, 500, 180))
 			prediction_text = "TYPE TO TRANSLATE"
+			prediction_label = "LETTER PREDICTION"
 		else:
-			if mode == "Record Mode":
-				partial = listener.partial_code
-				if not partial:
-					prediction_text = "Listening..."
-				else:
-					# Same prediction system as the other modes: word runs
-					# first, then individual letter candidates.
-					predicted_words = _predict_words(partial)
-					if predicted_words:
-						prediction_text = " / ".join(predicted_words)
-					else:
-						letter_predictions = predict_letters(partial)
-						if letter_predictions:
-							prediction_text = " / ".join(letter_predictions)
-						else:
-							prediction_text = "Word: " + decode_obvious(partial)
+			partial = listener.partial_code if mode == "Record Mode" else current_code
+			if not partial and mode == "Record Mode":
+				prediction_text = "Listening..."
+				prediction_label = "WORD PREDICTION"
 			else:
-				predictions = predict_letters(current_code)
-				if predictions:
-					prediction_text = " / ".join(predictions)
+				# Predict the word currently being formed: the committed
+				# letters of the current word plus the letter being pressed.
+				word_so_far = ""
+				if message and not message.endswith(" "):
+					word_so_far = message.split()[-1]
+				predicted_words = _predict_words(partial, word_so_far)
+				if predicted_words:
+					prediction_text = " / ".join(predicted_words)
+					prediction_label = "WORD PREDICTION"
 				else:
-					prediction_text = "Word: " + decode_obvious(current_code)
-		screen.blit(font.render("WORD PREDICTION" if mode == "Record Mode" else "LETTER PREDICTION", True, muted_text), (60, 585))
+					letter_predictions = predict_letters(partial)
+					if letter_predictions:
+						prediction_text = " / ".join(letter_predictions)
+						prediction_label = "LETTER PREDICTION"
+					elif partial:
+						prediction_text = "Word: " + decode_obvious(partial)
+						prediction_label = "LETTER PREDICTION"
+					else:
+						prediction_text = ""
+						prediction_label = "LETTER PREDICTION"
+		screen.blit(font.render(prediction_label, True, muted_text), (60, 585))
 		screen.blit(font.render(prediction_text, True, text_color), (60, 612))
 		if mode != "Translator Mode":
 			draw_message(message, pygame.Rect(625, 472, 500, 165))

@@ -37,7 +37,25 @@ Pick a mode from the `INPUT MODE` dropdown (or press `Up` / `Down` to cycle):
 
 ### Word prediction
 
-Record Mode and Keyboard Buttons predict the letter or word being formed as you send: word candidates first, then letter candidates.
+Record Mode, Keyboard Buttons, and the other sender modes predict the word
+being formed as you send. Predictions are computed from the real letter
+sequence being typed, so a Morse run never cuts across a letter boundary
+(a three-dot run suggests `S`/`V`/`H` words, never `IS`, which starts with
+`..`). The letters already committed in the current word are taken into
+account — after sending `H` then `E`, tapping the start of `L` predicts
+`HELP` / `HELLO` instead of unrelated words. Completed letters are
+prioritised over partial guesses, and when several words fit, the most
+common ones are listed first. Finished numbers (e.g. `.....` = 5) fall back
+to letter prediction instead of odd word guesses.
+
+The prediction logic lives in `morse.py`:
+`predict_letters()` (characters matching a partial run), `_predict_words()`
+(full word candidates given the current run + committed letters) and
+`decode_obvious()` (best decoding of a run). There is a unit-test suite:
+
+```bash
+python3 -m unittest test_morse -v
+```
 
 ## International Chat
 
