@@ -805,6 +805,66 @@ class MorseListener:
 			self._partial[0] = ""
 
 
+def _wrap_chat(text, measure=None):
+	"""Break a chat message into lines of at most 1080px.
+
+	*measure* returns the pixel width of a candidate line.  When omitted a
+	conservative character-count estimate is used so the helper is usable
+	standalone (e.g. in tests) without a font object.
+	"""
+	if measure is None:
+		measure = lambda candidate: len(candidate) * 16
+	lines = []
+	current = ""
+	for word in str(text).split():
+		candidate = f"{current} {word}".strip()
+		if measure(candidate) <= 1080:
+			current = candidate
+			continue
+		if current:
+			lines.append(current)
+		current = word
+	if current:
+		lines.append(current)
+	return lines or [" "]
+
+
+def chat_rendering(morse_code, translated):
+	"""Build the chat-log lines and optional note for a message.
+
+	A real Morse code string is shown verbatim with a note holding the
+	translation; anything else (plain text, or a stray boolean/status value)
+	falls back to displaying the text itself so a status flag can never leak
+	into the visible output.
+	"""
+	if isinstance(morse_code, str) and morse_code:
+		return _wrap_chat(morse_code), "-> " + translated
+	return _wrap_chat(translated), None
+
+
+def encode_words_to_morse(text):
+	"""Convert a chat message to space-separated Morse with / between words."""
+	words = []
+	for word in text.split():
+		cleaned = "".join(character for character in word.upper() if character in MORSE_CODE)
+		if cleaned:
+			words.append(" ".join(MORSE_CODE[character] for character in cleaned))
+	return " / ".join(words) if words else None
+
+
+def decode_morse_entry(buffer):
+	"""Decode chat Morse input: words are separated by / and letters by spaces."""
+	decoded = []
+	for word in buffer.strip().split(" / "):
+		letters = [letter for letter in word.split() if letter]
+		if letters:
+			decoded.append("".join(
+				_CHARACTER_BY_CODE.get(letter) or decode_obvious(letter)
+				for letter in letters
+			))
+	return " ".join(decoded)
+
+
 class _Translator:
 	"""Background worker that translates incoming chat messages, so the
 	pygame loop is never blocked by a network call to Google."""
@@ -1375,30 +1435,17 @@ def run_machine(config=None):
 			start_chat()
 
 	def wrap_chat(text):
-		lines = []
-		current = ""
-		for word in str(text).split():
-			candidate = f"{current} {word}".strip()
-			if chat_font.size(candidate)[0] <= 1080:
-				current = candidate
-				continue
-			if current:
-				lines.append(current)
-			current = word
-		if current:
-			lines.append(current)
-		return lines or [" "]
+		return _wrap_chat(text, measure=lambda candidate: chat_font.size(candidate)[0])
 
-	def submit_translation(entry, text, morse):
+	def submit_translation(entry, text, morse_code):
 		if chat_translator is None or not text:
 			return
 
 		def apply(translated):
-			if morse:
-				entry["lines"] = wrap_chat(morse)
-				entry["note"] = "-> " + translated
-			else:
-				entry["lines"] = wrap_chat(translated)
+			lines, note = chat_rendering(morse_code, translated)
+			entry["lines"] = lines
+			if note is not None:
+				entry["note"] = note
 
 		chat_translator.submit(apply, text, chat_display_lang)
 
@@ -1420,33 +1467,14 @@ def run_machine(config=None):
 			if morse:
 				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(morse)}
 				chat_log.append(entry)
-				submit_translation(entry, text, True)
+				submit_translation(entry, text, morse)
 			elif text:
 				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text)}
 				chat_log.append(entry)
 				if not same_lang_prefix(msg.get("lang"), chat_display_lang):
-					submit_translation(entry, text, False)
+					submit_translation(entry, text, None)
 		if len(chat_log) > 300:
 			del chat_log[:50]
-
-	def encode_words_to_morse(text):
-		words = []
-		for word in text.split():
-			cleaned = "".join(character for character in word.upper() if character in MORSE_CODE)
-			if cleaned:
-				words.append(" ".join(MORSE_CODE[character] for character in cleaned))
-		return " / ".join(words) if words else None
-
-	def decode_morse_entry(buffer):
-		decoded = []
-		for word in buffer.strip().split(" / "):
-			letters = [letter for letter in word.split() if letter]
-			if letters:
-				decoded.append("".join(
-					_CHARACTER_BY_CODE.get(letter) or decode_obvious(letter)
-					for letter in letters
-				))
-		return " ".join(decoded)
 
 	def morse_space():
 		nonlocal chat_input

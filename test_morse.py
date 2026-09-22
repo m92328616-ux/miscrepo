@@ -172,5 +172,72 @@ class SpaceAndBoundaryTests(unittest.TestCase):
 		self.assertEqual(morse.decode_timed(signals), "MA E")
 
 
+class ChatConversionTests(unittest.TestCase):
+	"""Criterion (issue #2): Morse-to-Word and Words-to-Morse chat output
+	must show the payload, never a stray boolean/status value."""
+
+	def test_morse_to_word_body_keeps_morse_and_notes_translation(self):
+		lines, note = morse.chat_rendering(".... . .-.. .-.. ---", "HELLO")
+		self.assertEqual(lines, [".... . .-.. .-.. ---"])
+		self.assertEqual(note, "-> HELLO")
+
+	def test_words_to_morse_round_trip(self):
+		self.assertEqual(
+			morse.encode_words_to_morse("hello world"),
+			".... . .-.. .-.. --- / .-- --- .-. .-.. -..",
+		)
+		self.assertEqual(
+			morse.decode_morse_entry(morse.encode_words_to_morse("HELLO WORLD")),
+			"HELLO WORLD",
+		)
+
+	def test_plain_text_translation_has_no_note(self):
+		lines, note = morse.chat_rendering(None, "HOLA")
+		self.assertEqual(lines, ["HOLA"])
+		self.assertIsNone(note)
+
+	def test_boolean_flag_never_renders_as_True(self):
+		# Regression: the old submit_translation leaked the boolean flag into
+		# wrap_chat, showing "True" as the message body.
+		for stray in (True, False, 1, 0):
+			lines, note = morse.chat_rendering(stray, "PAYLOAD")
+			for line in lines:
+				self.assertNotEqual(line.strip(), "True", pstring := str(stray))
+				self.assertNotIn("True", line)
+			self.assertEqual(lines, ["PAYLOAD"])
+			self.assertIsNone(note)
+
+	def test_chat_entry_body_is_never_True(self):
+		# Simulate the full submit path: the morse payload is stored verbatim,
+		# and the translation only fills the note.
+		morse_text = "... --- ..."
+		lines, note = morse.chat_rendering(morse_text, "SOS")
+		body = " ".join(lines)
+		self.assertNotIn("True", body)
+		self.assertTrue(body.strip().endswith("..."))
+		self.assertEqual(note, "-> SOS")
+
+
+class ChatWrapperTests(unittest.TestCase):
+	"""Criterion: the 1080px chat wrapping keeps messages intact."""
+
+	def test_wrap_chat_splits_long_messages_into_lines(self):
+		long_word = " ".join("totallybrokenmorse" for _ in range(40))
+		lines = morse._wrap_chat(long_word)
+		self.assertGreater(len(lines), 1)
+		self.assertEqual(" ".join(lines).split(), long_word.split())
+
+	def test_wrap_chat_single_short_line(self):
+		self.assertEqual(morse._wrap_chat("HELLO"), ["HELLO"])
+
+	def test_wrap_chat_empty_input_returns_placeholder(self):
+		self.assertEqual(morse._wrap_chat(""), [" "])
+
+	def test_wrap_chat_takes_custom_measure(self):
+		lines = morse._wrap_chat("A B C", measure=lambda candidate: len(candidate) * 1000)
+		self.assertEqual(" ".join(lines), "A B C")
+		self.assertGreaterEqual(len(lines), 1)
+
+
 if __name__ == "__main__":
 	unittest.main()
