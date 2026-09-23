@@ -1149,7 +1149,7 @@ def run_machine(config=None):
 		dot_sound = dash_sound = sound_channel = None
 
 	def play_code(code):
-		if not audio_enabled:
+		if not audio_enabled or dot_sound is None or dash_sound is None or sound_channel is None:
 			return
 		sounds = [dot_sound if symbol == "." else dash_sound for symbol in code if symbol in ".-"]
 		if not sounds:
@@ -1159,7 +1159,7 @@ def run_machine(config=None):
 			sound_channel.queue(sound)
 
 	def play_signal(signal):
-		if audio_enabled:
+		if audio_enabled and dot_sound is not None and dash_sound is not None:
 			(dot_sound if signal == "." else dash_sound).play()
 
 	def play_current():
@@ -1167,7 +1167,7 @@ def run_machine(config=None):
 			morse_output = encode(translator_text)
 		else:
 			morse_output = encode(message)
-		if audio_enabled and morse_output:
+		if audio_enabled and morse_output and sound_channel is not None:
 			sound_channel.play(make_morse_audio(morse_output))
 
 	def commit_letter():
@@ -1237,6 +1237,9 @@ def run_machine(config=None):
 			screen.blit(message_font.render("|", True, text_color), area.topleft)
 			return
 
+		message_font = pygame.font.Font(None, 86)
+		lines = []
+		line_height = 40
 		for size in range(72, 17, -2):
 			message_font = pygame.font.Font(None, size)
 			lines = []
@@ -1287,6 +1290,9 @@ def run_machine(config=None):
 		symbols = list(code)
 		if show_cursor:
 			symbols.append("|")
+		morse_font = pygame.font.Font(None, 56)
+		lines = [[]]
+		line_height = 0
 		for size in range(82, 19, -2):
 			morse_font = pygame.font.Font(None, size)
 			lines = [[]]
@@ -1323,7 +1329,11 @@ def run_machine(config=None):
 			if character == " ":
 				items.append(" ")
 			elif character in MORSE_CODE:
-				items.append((character, MORSE_CODE[character]))
+					items.append((character, MORSE_CODE[character]))
+		translation_font = pygame.font.Font(None, 30)
+		morse_font = pygame.font.Font(None, 30)
+		lines = [[]]
+		line_height = 0
 		for size in range(34, 13, -2):
 			translation_font = pygame.font.Font(None, max(size - 4, 12))
 			morse_font = pygame.font.Font(None, size)
@@ -1380,8 +1390,8 @@ def run_machine(config=None):
 		help_window.title("Morse Code List")
 		help_window.geometry("620x300")
 		help_window.configure(bg="#18222f")
-		help_window.protocol("WM_DELETE_WINDOW", help_window.withdraw)
-		help_window.bind("<Tab>", lambda _event: help_window.withdraw())
+		help_window.protocol("WM_DELETE_WINDOW", help_window.withdraw if help_window is not None else (lambda: None))
+		help_window.bind("<Tab>", lambda _event: help_window.withdraw() if help_window is not None else None)
 
 		title = tk.Label(
 			help_window,
@@ -1524,7 +1534,9 @@ def run_machine(config=None):
 
 		connected = chat_client is not None and chat_client.connected
 		if connected:
-			place = chat_client.country or chat_client.country_code or "?"
+			place = "?"
+			if chat_client is not None:
+				place = chat_client.country or chat_client.country_code or "?"
 			status = f"CONNECTED · YOU: {chat_nick} · {place}"
 			status_color = accent
 		elif chat_client is not None and chat_client.status_text == "connecting":
@@ -1756,7 +1768,7 @@ def run_machine(config=None):
 					dot_emitted = False
 
 		if mode == "Dot Stream Mode" and press_started is not None:
-			while now - last_dot >= dot_interval:
+			while last_dot is not None and now - last_dot >= dot_interval:
 				record_signal(".", last_dot + dot_interval)
 				play_signal(".")
 				last_dot += dot_interval
