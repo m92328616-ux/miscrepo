@@ -102,12 +102,28 @@ _TRANSLATE_CLIENTS = ("dict-chrome-ex", "gtx")
 
 # DejaVu/Liberation have no Arabic, Devanagari or CJK glyphs, so characters
 # in those scripts would render as blank boxes.  Glyphs are picked per
-# character from the most specific font that covers them.
+# character from the most specific font that covers them.  Each entry lists
+# candidate paths (paths differ across distributions) and the first one that
+# exists wins.
 _FONT_PATHS = {
-	"latin": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-	"cjk": "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-	"ar": "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
-	"hi": "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
+	"latin": (
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+		"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+		"/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+	),
+	"cjk": (
+		"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	),
+	"ar": (
+		"/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+		"/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+	),
+	"hi": (
+		"/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
+		"/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+	),
 }
 
 
@@ -137,12 +153,14 @@ class _FontStack:
 	def __init__(self, size):
 		self.fonts: dict[str, pygame.font.Font] = {}
 		self.primary: pygame.font.Font
-		for key, path in _FONT_PATHS.items():
-			if os.path.exists(path):
-				try:
-					self.fonts[key] = pygame.font.Font(path, size)
-				except Exception:
-					continue
+		for key, paths in _FONT_PATHS.items():
+			for path in paths:
+				if os.path.exists(path):
+					try:
+						self.fonts[key] = pygame.font.Font(path, size)
+					except Exception:
+						continue
+					break
 		found = self.fonts.get("latin")
 		self.primary = found if found is not None else pygame.font.Font(None, size)
 		self.fonts.setdefault("", self.primary)
@@ -1740,8 +1758,10 @@ def run_machine(config=None):
 		visible = rows[-max_rows:]
 		row_y = log_rect.y + 10
 		for text, color, row_font in visible:
-			screen.blit(row_font.render(text, True, color), (log_rect.x + 14, row_y))
-			row_y += small_height if row_font is chat_small_font else line_height
+			surface = row_font.render(text, True, color)
+			screen.blit(surface, (log_rect.x + 14, row_y))
+			advance = small_height if row_font is chat_small_font else line_height
+			row_y += max(advance, surface.get_bounding_rect().bottom + 2)
 		if not chat_log:
 			hint = "Connect and start typing…"
 			screen.blit(chat_font.render(hint, True, muted_text), (log_rect.x + 14, log_rect.y + 12))
