@@ -1056,6 +1056,7 @@ def run_machine(config=None):
 	chat_client = None
 	chat_translator = None
 	chat_log = []
+	chat_epoch = [0]
 	chat_input = ""
 	chat_mode = "normal"
 	chat_lang_open = False
@@ -1440,11 +1441,26 @@ def run_machine(config=None):
 	def submit_translation(entry, text, morse_code):
 		if chat_translator is None or not text:
 			return
+		chat_epoch[0] += 1
+		token = chat_epoch[0]
+		entry["token"] = token
 
 		def apply(translated):
+			if entry.get("token") != token:
+				return
 			apply_translation(entry, text, morse_code, translated)
 
 		chat_translator.submit(apply, text, chat_display_lang)
+
+	def re_translate_all():
+		if chat_translator is None:
+			return
+		for entry in chat_log:
+			if entry["kind"] != "chat":
+				continue
+			source = entry.get("source")
+			if source:
+				submit_translation(entry, source, entry.get("morse"))
 
 	def same_lang_prefix(first, second):
 		return (first or "").lower().split("-")[0] == (second or "").lower().split("-")[0]
@@ -1493,11 +1509,11 @@ def run_machine(config=None):
 			nick = msg.get("nick") or "?"
 			country = msg.get("country") or msg.get("countryCode") or ""
 			if morse:
-				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(morse)}
+				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(morse), "source": text, "morse": morse}
 				chat_log.append(entry)
 				submit_translation(entry, text, morse)
 			elif text:
-				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text)}
+				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text), "source": text}
 				chat_log.append(entry)
 				if msg.get("own") or not same_lang_prefix(msg.get("lang"), chat_display_lang):
 					submit_translation(entry, text, None)
@@ -1680,7 +1696,9 @@ def run_machine(config=None):
 						_code, _name = CHAT_LANGUAGES[_index]
 						_option_rect = pygame.Rect(chat_lang_rect.x, chat_lang_rect.y + 52 + (_index - chat_lang_scroll) * 34, chat_lang_rect.width, 34)
 						if _option_rect.collidepoint(event.pos):
-							chat_display_lang = _code
+							if _code != chat_display_lang:
+								chat_display_lang = _code
+								re_translate_all()
 							chat_lang_open = False
 				elif mode == "Translator Mode" and translate_lang_rect.collidepoint(event.pos):
 					translator_lang_open = not translator_lang_open

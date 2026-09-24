@@ -726,6 +726,9 @@ function addChat(m) {
   var isMorse = !!(m.morse);
   var entry = document.createElement("div");
   entry.className = "msg";
+  entry._sent = m.text || "";
+  entry._isMorse = isMorse;
+  entry._translated = "";
 
   var head = document.createElement("div");
   head.className = "head";
@@ -749,22 +752,49 @@ function addChat(m) {
     note.className = "note";
     note.textContent = "...";
     entry.appendChild(note);
+    entry._note = note;
     translateText(m.text, state.lang).then(function(t) { note.textContent = "-> " + t; });
   } else if (!isMorse && m.text && (m.own || (m.lang && !sameLang(m.lang, state.lang)))) {
-    var sentText = m.text;
-    translateText(m.text, state.lang).then(function(t) {
-      if (t && t.trim().toLowerCase() !== sentText.trim().toLowerCase()) {
-        body.textContent = t;
-        var origEl = document.createElement("div");
-        origEl.className = "orig";
-        origEl.textContent = sentText;
-        entry.appendChild(origEl);
-      }
-    });
+    entry._body = body;
+    translateText(m.text, state.lang).then(function(t) { entry._translated = t; renderTranslation(entry); });
   }
 
   trimLog();
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderTranslation(el) {
+  var sent = el._sent || "";
+  var t = el._translated || "";
+  var body = el._body;
+  if (!body) return;
+  if (!t || t.trim().toLowerCase() === sent.trim().toLowerCase()) {
+    body.textContent = sent;
+    if (el._orig) { el._orig.remove(); el._orig = null; }
+  } else {
+    body.textContent = t;
+    if (!el._orig) {
+      var origEl = document.createElement("div");
+      origEl.className = "orig";
+      origEl.textContent = sent;
+      el.appendChild(origEl);
+      el._orig = origEl;
+    }
+  }
+}
+
+function retranslateAll() {
+  var msgs = logEl.children;
+  for (var i = 0; i < msgs.length; i++) {
+    var el = msgs[i];
+    if (!el._sent) continue;
+    if (el._isMorse) {
+      var note = el._note;
+      if (note) translateText(el._sent, state.lang).then(function(t) { note.textContent = "-> " + t; });
+    } else if (el._body) {
+      translateText(el._sent, state.lang).then(function(t) { el._translated = t; renderTranslation(el); });
+    }
+  }
 }
 
 function renderUsers() {
@@ -935,6 +965,7 @@ langEl.value = localStorage.getItem("mm_lang") || "en";
 langEl.addEventListener("change", function() {
   state.lang = langEl.value;
   localStorage.setItem("mm_lang", state.lang);
+  retranslateAll();
 });
 nickEl.addEventListener("change", function() {
   localStorage.setItem("mm_nick", nickEl.value);
