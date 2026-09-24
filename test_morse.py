@@ -355,6 +355,33 @@ class GoogleTranslateTargetTests(unittest.TestCase):
 		self.assertEqual(morse.google_translate("hello", ""), "hello")
 		self.assertEqual(morse.google_translate(None, "ru"), None)
 
+	def test_falls_back_to_next_client_when_first_is_rate_limited(self):
+		class _RateLimited(OSError):
+			pass
+
+		calls = []
+
+		def fake_open(request, timeout=None):
+			calls.append(request.full_url)
+			if len(calls) == 1:
+				raise _RateLimited(429, "Too Many Requests")
+			return mock.MagicMock(
+				__enter__=lambda self: self,
+				__exit__=lambda *args: False,
+				read=lambda: '[[["привет мир","hello world",null,null,10]],null,"en",null]'.encode("utf-8"),
+			)
+
+		with mock.patch.object(morse.urllib.request, "urlopen", side_effect=fake_open):
+			self.assertEqual(morse.google_translate("hello world", "ru"), "привет мир")
+		self.assertGreaterEqual(len(calls), 2)
+
+	def test_returns_original_text_when_every_client_fails(self):
+		def fake_open(request, timeout=None):
+			raise OSError(503, "Service Unavailable")
+
+		with mock.patch.object(morse.urllib.request, "urlopen", side_effect=fake_open):
+			self.assertEqual(morse.google_translate("hello world", "ru"), "hello world")
+
 
 class TranslatorWorkerTargetTests(unittest.TestCase):
 	"""Criterion (issue #3): the background worker translates messages into

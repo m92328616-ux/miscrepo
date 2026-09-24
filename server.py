@@ -49,6 +49,10 @@ GEO_CACHE = {}
 
 _TRANSLATE_CACHE = {}
 
+# The public endpoint rate-limits per client; try several so a blocked
+# client (e.g. HTTP 429) can't silently break translation.
+_TRANSLATE_CLIENTS = ("dict-chrome-ex", "gtx")
+
 
 def google_translate(text, target):
 	"""Translate *text* to *target* via the public Google endpoint.
@@ -62,25 +66,26 @@ def google_translate(text, target):
 	key = (text, target)
 	if key in _TRANSLATE_CACHE:
 		return _TRANSLATE_CACHE[key]
-	query = urllib.parse.urlencode(
-		{"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text}
-	)
-	request = urllib.request.Request(
-		"https://translate.googleapis.com/translate_a/single?" + query,
-		headers={
-			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-			"Referer": "https://translate.google.com/",
-		},
-	)
-	try:
-		with urllib.request.urlopen(request, timeout=6) as response:
-			payload = json.loads(response.read().decode("utf-8"))
-		joined = "".join(part[0] for part in payload[0] if part and part[0])
-		if joined:
-			_TRANSLATE_CACHE[key] = joined
-			return joined
-	except Exception:
-		pass
+	for client in _TRANSLATE_CLIENTS:
+		query = urllib.parse.urlencode(
+			{"client": client, "sl": "auto", "tl": target, "dt": "t", "q": text}
+		)
+		request = urllib.request.Request(
+			"https://translate.googleapis.com/translate_a/single?" + query,
+			headers={
+				"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+				"Referer": "https://translate.google.com/",
+			},
+		)
+		try:
+			with urllib.request.urlopen(request, timeout=6) as response:
+				payload = json.loads(response.read().decode("utf-8"))
+			joined = "".join(part[0] for part in payload[0] if part and part[0])
+			if joined:
+				_TRANSLATE_CACHE[key] = joined
+				return joined
+		except Exception:
+			continue
 	return text
 
 

@@ -95,27 +95,37 @@ DEFAULT_CHAT_NICK = os.environ.get("USER") or os.environ.get("USERNAME") or "Ope
 
 _TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 
+# The public endpoint rate-limits per client; try several so a blocked
+# client (e.g. HTTP 429) can't silently break translation.
+_TRANSLATE_CLIENTS = ("dict-chrome-ex", "gtx")
+
 
 @lru_cache(maxsize=4096)
 def _translate_cached(text, target, source):
 	"""Hit the public Google endpoint; raises on failure so failed
 	attempts are never cached and get retried later."""
-	query = urllib.parse.urlencode(
-		{"client": "gtx", "sl": source, "tl": target, "dt": "t", "q": text}
-	)
-	request = urllib.request.Request(
-		_TRANSLATE_ENDPOINT + "?" + query,
-		headers={
-			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-			"Referer": "https://translate.google.com/",
-		},
-	)
-	with urllib.request.urlopen(request, timeout=6) as response:
-		payload = json.loads(response.read().decode("utf-8"))
-	joined = "".join(part[0] for part in payload[0] if part and part[0])
-	if not joined:
-		raise RuntimeError("empty translation")
-	return joined
+	last_error = None
+	for client in _TRANSLATE_CLIENTS:
+		query = urllib.parse.urlencode(
+			{"client": client, "sl": source, "tl": target, "dt": "t", "q": text}
+		)
+		request = urllib.request.Request(
+			_TRANSLATE_ENDPOINT + "?" + query,
+			headers={
+				"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+				"Referer": "https://translate.google.com/",
+			},
+		)
+		try:
+			with urllib.request.urlopen(request, timeout=6) as response:
+				payload = json.loads(response.read().decode("utf-8"))
+			joined = "".join(part[0] for part in payload[0] if part and part[0])
+			if joined:
+				return joined
+			last_error = RuntimeError("empty translation")
+		except Exception as error:
+			last_error = error
+	raise last_error if last_error else RuntimeError("translation unavailable")
 
 
 def google_translate(text, target, source="auto"):
