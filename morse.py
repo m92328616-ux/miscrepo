@@ -866,6 +866,8 @@ def apply_translation(entry, text, morse_code, translated):
 	the translation.  Plain-text messages show the translation as the body;
 	when it actually differs from what was sent, the original words are kept
 	on the entry so the UI can render them underneath in smaller grey text.
+	When the translation matches what was sent (e.g. switching back to the
+	original language) the grey sub-line is removed again.
 	"""
 	lines, note = chat_rendering(morse_code, translated)
 	entry["lines"] = lines
@@ -873,6 +875,8 @@ def apply_translation(entry, text, morse_code, translated):
 		entry["note"] = note
 	elif translated.strip().lower() != text.strip().lower():
 		entry["original"] = text
+	else:
+		entry.pop("original", None)
 
 
 def encode_words_to_morse(text):

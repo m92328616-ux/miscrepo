@@ -269,6 +269,17 @@ class ApplyTranslationTests(unittest.TestCase):
 		self.assertEqual(entry["lines"], ["hello world"])
 		self.assertNotIn("original", entry)
 
+	def test_back_to_original_language_removes_grey_sub_line(self):
+		entry = {"lines": ["hola"]}
+		morse.apply_translation(entry, "hola", None, "Hola")
+		self.assertEqual(entry["lines"], ["Hola"])
+		self.assertNotIn("original", entry)
+		morse.apply_translation(entry, "hola", None, "Hello")
+		self.assertEqual(entry["original"], "hola")
+		morse.apply_translation(entry, "hola", None, "Hola")
+		self.assertEqual(entry["lines"], ["Hola"])
+		self.assertNotIn("original", entry)
+
 	def test_morse_message_keeps_morse_with_note(self):
 		entry = {"lines": [".... . .-.. .-.. ---"]}
 		morse.apply_translation(entry, "hello", ".... . .-.. .-.. ---", "Hola")
