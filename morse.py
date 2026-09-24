@@ -1267,8 +1267,13 @@ def run_machine(config=None):
 	chat_lang_rect = pygame.Rect(710, 270, 175, 52)
 	chat_status_rect = pygame.Rect(895, 270, 230, 52)
 
-	chat_font = get_font_stack(30)
-	chat_small_font = get_font_stack(20)
+# When a real Latin TTF is available DejaVu renders ~1.75x taller than the
+	# built-in font the chat historically used, so drop to point sizes whose
+	# Latin glyphs match the old physical size (height 20 / 13).  Script fonts
+	# scale to match; if only the built-in font exists the old 30/20 stands.
+	_latin_real = any(os.path.exists(path) for path in _FONT_PATHS["latin"])
+	chat_font = get_font_stack(17 if _latin_real else 30)
+	chat_small_font = get_font_stack(11 if _latin_real else 20)
 
 	def make_tone(duration_ms):
 		sample_rate = 44100
