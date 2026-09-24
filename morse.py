@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
+import pygame
 from functools import lru_cache
 
 
@@ -98,6 +99,119 @@ _TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 # The public endpoint rate-limits per client; try several so a blocked
 # client (e.g. HTTP 429) can't silently break translation.
 _TRANSLATE_CLIENTS = ("dict-chrome-ex", "gtx")
+
+# DejaVu/Liberation have no Arabic, Devanagari or CJK glyphs, so characters
+# in those scripts would render as blank boxes.  Glyphs are picked per
+# character from the most specific font that covers them.
+_FONT_PATHS = {
+	"latin": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	"cjk": "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	"ar": "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+	"hi": "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
+}
+
+
+def _script_of(ch):
+	"""Map one character to a script key (\"cjk\", \"ar\", \"hi\" or \"\")."""
+	o = ord(ch)
+	if (0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F or 0x08A0 <= o <= 0x08FF
+			or 0xFB50 <= o <= 0xFDFF or 0xFE70 <= o <= 0xFEFF):
+		return "ar"
+	if 0x0900 <= o <= 0x097F or 0xA8E0 <= o <= 0xA8FF or 0x1CD0 <= o <= 0x1CFF or 0x20F0 == o:
+		return "hi"
+	if (0x2E80 <= o <= 0x303F or 0x3040 <= o <= 0x30FF or 0x31C0 <= o <= 0x4DBF
+			or 0x4E00 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF or 0xF900 <= o <= 0xFAFF
+			or 0xFF00 <= o <= 0xFFEF or 0x20000 <= o <= 0x2FFFF):
+		return "cjk"
+	return ""
+
+
+class _FontStack:
+	"""A pygame font that falls back to a script-appropriate TTF per character.
+
+	Presents the subset of the ``pygame.font.Font`` API the renderer uses
+	(``render``, ``size``, ``get_height``, ``get_linesize``); mixed-script
+	strings are split into runs of matching fonts and composited.
+	"""
+
+	def __init__(self, size):
+		self.fonts: dict[str, pygame.font.Font] = {}
+		self.primary: pygame.font.Font
+		for key, path in _FONT_PATHS.items():
+			if os.path.exists(path):
+				try:
+					self.fonts[key] = pygame.font.Font(path, size)
+				except Exception:
+					continue
+		found = self.fonts.get("latin")
+		self.primary = found if found is not None else pygame.font.Font(None, size)
+		self.fonts.setdefault("", self.primary)
+
+	def _font(self, ch):
+		return self.fonts.get(_script_of(ch), self.primary)
+
+	def groups(self, text):
+		"""Yield ``(font, chunk)`` for runs of characters sharing one font."""
+		if not text:
+			return []
+		groups = []
+		current = self._font(text[0])
+		buffer = [text[0]]
+		for ch in text[1:]:
+			font = self._font(ch)
+			if font is not current:
+				groups.append((current, "".join(buffer)))
+				buffer = [ch]
+				current = font
+			else:
+				buffer.append(ch)
+		if buffer:
+			groups.append((current, "".join(buffer)))
+		return groups
+
+	def size(self, text):
+		groups = self.groups(text)
+		if not groups:
+			return self.primary.size("")
+		width = sum(font.size(chunk)[0] for font, chunk in groups)
+		height = max(font.get_height() for font, chunk in groups)
+		return (width, height)
+
+	def get_height(self):
+		return self.primary.get_height()
+
+	def get_linesize(self):
+		return self.primary.get_linesize()
+
+	def render(self, text, antialias, color, bgcolor=None):
+		groups = self.groups(text)
+		if not groups:
+			return self.primary.render("", antialias, color, bgcolor)
+		width = sum(font.size(chunk)[0] for font, chunk in groups)
+		height = max(font.get_height() for font, chunk in groups)
+		surface = pygame.Surface((max(width, 1), height), pygame.SRCALPHA)
+		if bgcolor:
+			surface.fill(bgcolor)
+		offset = 0
+		for font, chunk in groups:
+			glyph = font.render(chunk, antialias, color, bgcolor)
+			surface.blit(glyph, (offset, 0))
+			offset += glyph.get_width()
+		if bgcolor:
+			return surface.convert()
+		return surface
+
+
+_STACK_CACHE = {}
+
+
+def get_font_stack(size):
+	"""Return a cached per-size font stack."""
+	stack = _STACK_CACHE.get(size)
+	if stack is None:
+		stack = _FontStack(size)
+		_STACK_CACHE[size] = stack
+	return stack
 
 
 @lru_cache(maxsize=4096)
@@ -1135,20 +1249,8 @@ def run_machine(config=None):
 	chat_lang_rect = pygame.Rect(710, 270, 175, 52)
 	chat_status_rect = pygame.Rect(895, 270, 230, 52)
 
-	def load_chat_font(size):
-		for path in (
-			"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-			"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-		):
-			if os.path.exists(path):
-				try:
-					return pygame.font.Font(path, size)
-				except Exception:
-					pass
-		return pygame.font.Font(None, size)
-
-	chat_font = load_chat_font(30)
-	chat_small_font = load_chat_font(20)
+	chat_font = get_font_stack(30)
+	chat_small_font = get_font_stack(20)
 
 	def make_tone(duration_ms):
 		sample_rate = 44100
@@ -1281,17 +1383,18 @@ def run_machine(config=None):
 
 	def draw_message(text, area):
 		if not text:
-			message_font = pygame.font.Font(None, 86)
+			message_font = get_font_stack(86)
 			screen.blit(message_font.render("|", True, text_color), area.topleft)
 			return
 
-		message_font = pygame.font.Font(None, 86)
 		lines = []
 		line_height = 40
+		message_font = get_font_stack(86)
 		for size in range(72, 17, -2):
-			message_font = pygame.font.Font(None, size)
+			message_font = get_font_stack(size)
 			lines = []
 			for paragraph in text.split("\n"):
+				line = ""
 				line = ""
 				for word in paragraph.split():
 					remaining = word
@@ -1963,12 +2066,13 @@ def run_machine(config=None):
 				)
 				screen.blit(font.render(_t_hint, True, muted_text), (625, 452))
 			if translator_translation and _t_input_text and translator_translation.strip().lower() != _t_input_text.lower():
+				_t_orig_font = get_font_stack(32)
 				_t_orig_line = _wrap_chat(
 					"ORIGINAL: " + _t_input_text,
-					measure=lambda candidate: font.size(candidate)[0],
+					measure=lambda candidate: _t_orig_font.size(candidate)[0],
 					max_width=500,
 				)[0]
-				screen.blit(font.render(_t_orig_line, True, muted_text), (625, 554))
+				screen.blit(_t_orig_font.render(_t_orig_line, True, muted_text), (625, 554))
 			screen.blit(label_font.render("MORSE OUTPUT", True, muted_text), (625, 590))
 			_morse_encoded = encode(_t_input_text) if _t_input_text else ""
 			_morse_lines = _wrap_chat(_morse_encoded or " ", measure=lambda candidate: chat_font.size(candidate)[0])[:2]

@@ -5,9 +5,12 @@ Run with:
 	python3 -m unittest test_morse -v
 """
 
+import os
 import time
 import unittest
 from unittest import mock
+
+import pygame
 
 import morse
 
@@ -286,6 +289,72 @@ class ApplyTranslationTests(unittest.TestCase):
 		self.assertEqual(entry["lines"], [".... . .-.. .-.. ---"])
 		self.assertEqual(entry["note"], "-> Hola")
 		self.assertNotIn("original", entry)
+
+
+class ScriptClassificationTests(unittest.TestCase):
+	"""Criterion: characters from scripts the base font cannot draw (Arabic,
+	Devanagari, CJK) are routed to a script-appropriate fallback font so they
+	never render as blank boxes."""
+
+	def test_arabic_chars_map_to_ar(self):
+		for ch in "ابتمرحبا":
+			self.assertEqual(morse._script_of(ch), "ar")
+
+	def test_devanagari_chars_map_to_hi(self):
+		for ch in "नमस्तेदुनिया":
+			self.assertEqual(morse._script_of(ch), "hi")
+
+	def test_cjk_chars_map_to_cjk(self):
+		for ch in "你好世界こんにちは가나다":
+			self.assertEqual(morse._script_of(ch), "cjk")
+
+	def test_latin_cyrillic_and_whitespace_default(self):
+		for ch in "ABCxyzпизд":
+			self.assertEqual(morse._script_of(ch), "")
+		self.assertEqual(morse._script_of(" "), "")
+
+
+class FontStackTests(unittest.TestCase):
+	"""The fallback font stack renders mixed-script strings as real glyphs."""
+
+	@classmethod
+	def setUpClass(cls):
+		try:
+			pygame.font.init()
+			cls._font_ready = True
+		except pygame.error:
+			cls._font_ready = False
+
+	def test_groups_split_by_script(self):
+		stack = morse.get_font_stack(20)
+		groups = [(morse._script_of(chunk[0]), chunk) for _, chunk in stack.groups("hello 你好")]
+		self.assertEqual([script for script, _ in groups], ["", "cjk"])
+		self.assertEqual(groups[1][1], "你好")
+
+	def test_size_returns_pygame_tuple(self):
+		stack = morse.get_font_stack(20)
+		w, h = stack.size("hello 你好")
+		self.assertIsInstance(w, int)
+		self.assertIsInstance(h, int)
+		self.assertGreater(w, 0)
+		self.assertGreater(h, 0)
+
+	def test_renders_real_glyphs_not_blank_boxes(self):
+		if not self._font_ready:
+			self.skipTest("pygame font module unavailable")
+		stack = morse.get_font_stack(30)
+		for text in ("你好世界", "こんにちは", "안녕하세요", "नमस्ते", "مرحبا"):
+			surface = stack.render(text, True, (255, 255, 255))
+			colors = {
+				tuple(surface.get_at((x, y)))
+				for x in range(surface.get_width())
+				for y in range(surface.get_height())
+			}
+			opaque = {c for c in colors if c[3] > 0}
+			self.assertGreater(
+				len(opaque), 3,
+				msg=f"glyphs for {text!r} look like blank boxes",
+			)
 
 
 class GoogleTranslateTargetTests(unittest.TestCase):
