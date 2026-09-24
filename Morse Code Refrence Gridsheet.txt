@@ -17,3 +17,6 @@
 Arrows pointing to the left | Arrows pointing to the right 
 mean dashes while			| mean dots while arrows 
 down arrows mean dots.		| pointing down mean dashes.
+
+
+This may look a wrong in Github repo so make sure to download the package or code first when viewing.
