@@ -859,6 +859,22 @@ def chat_rendering(morse_code, translated):
 	return _wrap_chat(translated), None
 
 
+def apply_translation(entry, text, morse_code, translated):
+	"""Apply a finished translation to a chat entry.
+
+	True Morse messages keep the Morse lines verbatim with a note carrying
+	the translation.  Plain-text messages show the translation as the body;
+	when it actually differs from what was sent, the original words are kept
+	on the entry so the UI can render them underneath in smaller grey text.
+	"""
+	lines, note = chat_rendering(morse_code, translated)
+	entry["lines"] = lines
+	if note is not None:
+		entry["note"] = note
+	elif translated.strip().lower() != text.strip().lower():
+		entry["original"] = text
+
+
 def encode_words_to_morse(text):
 	"""Convert a chat message to space-separated Morse with / between words."""
 	words = []
@@ -1075,6 +1091,7 @@ def run_machine(config=None):
 	panel_highlight = (31, 44, 59)
 	text_color = (235, 240, 245)
 	muted_text = (156, 171, 187)
+	muted_light = (128, 142, 158)
 	accent = (77, 201, 176)
 	dash_color = (242, 186, 73)
 	accent_soft = (45, 88, 91)
@@ -1126,6 +1143,7 @@ def run_machine(config=None):
 		return pygame.font.Font(None, size)
 
 	chat_font = load_chat_font(30)
+	chat_small_font = load_chat_font(20)
 
 	def make_tone(duration_ms):
 		sample_rate = 44100
@@ -1424,10 +1442,7 @@ def run_machine(config=None):
 			return
 
 		def apply(translated):
-			lines, note = chat_rendering(morse_code, translated)
-			entry["lines"] = lines
-			if note is not None:
-				entry["note"] = note
+			apply_translation(entry, text, morse_code, translated)
 
 		chat_translator.submit(apply, text, chat_display_lang)
 
@@ -1583,23 +1598,27 @@ def run_machine(config=None):
 		for entry in chat_log:
 			if entry["kind"] == "system":
 				for line in entry["lines"]:
-					rows.append((line, muted_text))
+					rows.append((line, muted_text, chat_font))
 				continue
 			header = entry["nick"]
 			if entry.get("country"):
 				header += f"  [{entry['country']}]"
-			rows.append((header, accent))
+			rows.append((header, accent, chat_font))
 			for line in entry["lines"]:
-				rows.append((line, text_color))
+				rows.append((line, text_color, chat_font))
+			if entry.get("original"):
+				for line in _wrap_chat(entry["original"], measure=lambda candidate: chat_small_font.size(candidate)[0]):
+					rows.append((line, muted_light, chat_small_font))
 			if entry.get("note"):
-				rows.append((entry["note"], muted_text))
+				rows.append((entry["note"], muted_text, chat_small_font))
 		line_height = chat_font.get_linesize() + 2
-		max_rows = (log_rect.height - 20) // line_height
+		small_height = chat_small_font.get_linesize() + 2
+		max_rows = (log_rect.height - 36) // line_height
 		visible = rows[-max_rows:]
 		row_y = log_rect.y + 10
-		for text, color in visible:
-			screen.blit(chat_font.render(text, True, color), (log_rect.x + 14, row_y))
-			row_y += line_height
+		for text, color, row_font in visible:
+			screen.blit(row_font.render(text, True, color), (log_rect.x + 14, row_y))
+			row_y += small_height if row_font is chat_small_font else line_height
 		if not chat_log:
 			hint = "Connect and start typing…"
 			screen.blit(chat_font.render(hint, True, muted_text), (log_rect.x + 14, log_rect.y + 12))

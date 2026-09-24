@@ -120,7 +120,7 @@ Three input modes (choose from the **CHAT MODE** button on the desktop, or the *
 
 - **Send text** — press `Enter` to send the current input.
 - **Morse to Word** — manual Morse entry; *hello* becomes `.... . .-.. .-.. ---` as you tap, and `Enter` sends it with the decoded word `HELLO`.
-- **Display language** — open the **LANG** dropdown and pick your language. Incoming messages are automatically translated into that language using the free Google Translate endpoint, in a background thread so the UI never freezes. If translation is unavailable the original text is shown.
+- **Display language** — open the **LANG** dropdown and pick your language. Incoming messages (and your own sent messages) are automatically translated into that language using the free Google Translate endpoint, in a background thread so the UI never freezes. Translated messages show the translation above and the original sent words underneath in smaller grey text; if translation is unavailable the original text is shown.
 - **Country** — each message shows the sender's country, resolved from their IP by the server.
 - The **CONNECT / DISCONNECT** button controls the connection; the header shows your status and the current online users.
 

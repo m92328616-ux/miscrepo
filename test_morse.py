@@ -251,6 +251,32 @@ class ChatWrapperTests(unittest.TestCase):
 			self.assertLessEqual(len(line) * 20, 100)
 
 
+class ApplyTranslationTests(unittest.TestCase):
+	"""Criterion: when a chat message is translated, the translation becomes
+	the visible body and the original sent words are kept underneath for the
+	small grey sub-line."""
+
+	def test_text_translation_keeps_original_below(self):
+		entry = {"lines": ["hello world"]}
+		morse.apply_translation(entry, "hello world", None, "Hola Mundo")
+		self.assertEqual(entry["lines"], ["Hola Mundo"])
+		self.assertEqual(entry["original"], "hello world")
+		self.assertNotIn("note", entry)
+
+	def test_unchanged_translation_does_not_duplicate_original(self):
+		entry = {"lines": ["hello world"]}
+		morse.apply_translation(entry, "hello world", None, "hello world")
+		self.assertEqual(entry["lines"], ["hello world"])
+		self.assertNotIn("original", entry)
+
+	def test_morse_message_keeps_morse_with_note(self):
+		entry = {"lines": [".... . .-.. .-.. ---"]}
+		morse.apply_translation(entry, "hello", ".... . .-.. .-.. ---", "Hola")
+		self.assertEqual(entry["lines"], [".... . .-.. .-.. ---"])
+		self.assertEqual(entry["note"], "-> Hola")
+		self.assertNotIn("original", entry)
+
+
 class GoogleTranslateTargetTests(unittest.TestCase):
 	"""Criterion (issue #3): the selected language is the translation target,
 	the source language is auto-detected, and supported languages translate

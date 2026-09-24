@@ -558,6 +558,7 @@ WEB_PAGE = r"""<!doctype html>
   .head .country { color: #9cabbb; font-weight: normal; }
   .body { color: #ff6; white-space: pre-wrap; word-break: break-word; }
   .body.text { color: #ebf0f5; }
+  .orig { color: #80908e; font-size: 12px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
   .note { color: #9cabbb; font-size: 13px; margin-top: 2px; }
   .sys { color: #9cabbb; font-size: 13px; margin: 4px 0; }
   footer {
@@ -750,7 +751,16 @@ function addChat(m) {
     entry.appendChild(note);
     translateText(m.text, state.lang).then(function(t) { note.textContent = "-> " + t; });
   } else if (!isMorse && m.text && (m.own || (m.lang && !sameLang(m.lang, state.lang)))) {
-    translateText(m.text, state.lang).then(function(t) { body.textContent = t; });
+    var sentText = m.text;
+    translateText(m.text, state.lang).then(function(t) {
+      if (t && t.trim().toLowerCase() !== sentText.trim().toLowerCase()) {
+        body.textContent = t;
+        var origEl = document.createElement("div");
+        origEl.className = "orig";
+        origEl.textContent = sentText;
+        entry.appendChild(origEl);
+      }
+    });
   }
 
   trimLog();
