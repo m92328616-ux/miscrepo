@@ -822,8 +822,8 @@ class MorseListener:
 			self._partial[0] = ""
 
 
-def _wrap_chat(text, measure=None):
-	"""Break a chat message into lines of at most 1080px.
+def _wrap_chat(text, measure=None, max_width=1080):
+	"""Break a chat message into lines of at most *max_width* pixels.
 
 	*measure* returns the pixel width of a candidate line.  When omitted a
 	conservative character-count estimate is used so the helper is usable
@@ -835,7 +835,7 @@ def _wrap_chat(text, measure=None):
 	current = ""
 	for word in str(text).split():
 		candidate = f"{current} {word}".strip()
-		if measure(candidate) <= 1080:
+		if measure(candidate) <= max_width:
 			current = candidate
 			continue
 		if current:
@@ -1910,20 +1910,28 @@ def run_machine(config=None):
 				preview_code += "-" if now - press_started >= dash_threshold else "."
 			draw_morse(preview_code, pygame.Rect(60, 472, 470, 100), bool(cursor.strip()))
 		if mode == "Translator Mode":
+			_t_input_text = translator_text.strip()
 			if translator_translation:
-				draw_message(translator_translation, pygame.Rect(625, 452, 500, 90))
+				draw_message(translator_translation, pygame.Rect(625, 452, 500, 96))
 			else:
 				_t_hint = (
 					"Translating..."
-					if translator_translate_pending or translator_text.strip()
+					if translator_translate_pending or _t_input_text
 					else f"Type text to translate into {_tlang_name}."
 				)
 				screen.blit(font.render(_t_hint, True, muted_text), (625, 452))
-			screen.blit(label_font.render("MORSE OUTPUT", True, muted_text), (625, 556))
-			_morse_encoded = encode(translator_text) if translator_text.strip() else ""
+			if translator_translation and _t_input_text and translator_translation.strip().lower() != _t_input_text.lower():
+				_t_orig_line = _wrap_chat(
+					"ORIGINAL: " + _t_input_text,
+					measure=lambda candidate: font.size(candidate)[0],
+					max_width=500,
+				)[0]
+				screen.blit(font.render(_t_orig_line, True, muted_text), (625, 554))
+			screen.blit(label_font.render("MORSE OUTPUT", True, muted_text), (625, 590))
+			_morse_encoded = encode(_t_input_text) if _t_input_text else ""
 			_morse_lines = _wrap_chat(_morse_encoded or " ", measure=lambda candidate: chat_font.size(candidate)[0])[:2]
 			for _m_index, _m_line in enumerate(_morse_lines):
-				screen.blit(chat_font.render(_m_line, True, text_color), (625, 596 + _m_index * 30))
+				screen.blit(chat_font.render(_m_line, True, text_color), (625, 622 + _m_index * 30))
 			prediction_text = "TYPE TO TRANSLATE"
 			prediction_label = "LETTER PREDICTION"
 		else:

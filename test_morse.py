@@ -240,6 +240,16 @@ class ChatWrapperTests(unittest.TestCase):
 		self.assertEqual(" ".join(lines), "A B C")
 		self.assertGreaterEqual(len(lines), 1)
 
+	def test_wrap_chat_respects_max_width(self):
+		lines = morse._wrap_chat(
+			"HELLO WORLD SPLIT HERE",
+			measure=lambda candidate: len(candidate) * 20,
+			max_width=100,
+		)
+		self.assertTrue(lines)
+		for line in lines:
+			self.assertLessEqual(len(line) * 20, 100)
+
 
 class GoogleTranslateTargetTests(unittest.TestCase):
 	"""Criterion (issue #3): the selected language is the translation target,
