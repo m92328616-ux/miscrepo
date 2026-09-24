@@ -1484,7 +1484,7 @@ def run_machine(config=None):
 			elif text:
 				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text)}
 				chat_log.append(entry)
-				if not same_lang_prefix(msg.get("lang"), chat_display_lang):
+				if msg.get("own") or not same_lang_prefix(msg.get("lang"), chat_display_lang):
 					submit_translation(entry, text, None)
 		if len(chat_log) > 300:
 			del chat_log[:50]
@@ -1525,6 +1525,7 @@ def run_machine(config=None):
 			"lang": chat_display_lang,
 			"text": text,
 			"morse": morse,
+			"own": True,
 		})
 		chat_input = ""
 

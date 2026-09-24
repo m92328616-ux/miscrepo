@@ -749,7 +749,7 @@ function addChat(m) {
     note.textContent = "...";
     entry.appendChild(note);
     translateText(m.text, state.lang).then(function(t) { note.textContent = "-> " + t; });
-  } else if (!isMorse && m.text && m.lang && !sameLang(m.lang, state.lang)) {
+  } else if (!isMorse && m.text && (m.own || (m.lang && !sameLang(m.lang, state.lang)))) {
     translateText(m.text, state.lang).then(function(t) { body.textContent = t; });
   }
 
@@ -848,7 +848,7 @@ function send() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sid: state.sid, text: text, morse: morse })
   }).catch(function() {});
-  addChat({ nick: state.nick, country: "", lang: state.lang, text: text, morse: morse });
+  addChat({ nick: state.nick, country: "", lang: state.lang, text: text, morse: morse, own: true });
   inputEl.value = "";
   state.morseBuf = "";
   renderMorse();
