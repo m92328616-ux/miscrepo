@@ -19,7 +19,7 @@ Pick a mode from the `INPUT MODE` dropdown (or press `Up` / `Down` to cycle):
 | **Duration Mode** | Tap `SPACE` briefly (under ~180ms) for a dot, hold longer for a dash. Auto-commits letters/words based on pause length. |
 | **Dot Stream Mode** | Tap `SPACE` for a dash, hold it to stream repeating dots. |
 | **Keyboard Buttons** | Press `.` for a dot, `-` for a dash. |
-| **Translator Mode** | Type a word or phrase; the app shows its Morse translation with a `SOUND` button to hear it (adjustable playback speed). |
+| **Translator Mode** | Type a word or phrase; the app translates it into your chosen display language and shows the Morse output with a `SOUND` button to hear it (adjustable playback speed). Use the `LANG` dropdown to pick the target language — the selected language is always the translation target, the source language is auto-detected, and changing the language re-translates the current text. |
 | **Record Mode** | Point your mic at Morse beeps. Uses FFT tonality analysis to ignore human speech and only decode pure tones. `M` (or the button) toggles slow-motion; `Enter` forces a letter. |
 | **International Chat** | Connect to a shared chat server to talk with Morse users around the world (see below). |
 

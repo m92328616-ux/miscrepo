@@ -133,12 +133,19 @@ def google_translate(text, target, source="auto"):
 
 
 def encode(text):
-	"""Convert text to Morse, using / between words."""
+	"""Convert text to Morse, using / between words.
+
+	Characters that have no Morse representation (e.g. foreign-script
+	letters, most punctuation) are skipped so any Unicode text can be
+	played or displayed without crashing (issue #3 support).
+	"""
 	words = text.upper().split()
-	return " / ".join(
-		" ".join(MORSE_CODE[character] for character in word)
-		for word in words
-	)
+	encoded_words = []
+	for word in words:
+		codes = [MORSE_CODE[character] for character in word if character in MORSE_CODE]
+		if codes:
+			encoded_words.append(" ".join(codes))
+	return " / ".join(encoded_words)
 
 
 def decode_obvious(morse):
@@ -1027,6 +1034,13 @@ def run_machine(config=None):
 	chat_mode = "normal"
 	chat_lang_open = False
 	chat_lang_scroll = 0
+	translator_lang = "en"
+	translator_lang_open = False
+	translator_lang_scroll = 0
+	translator_translation = ""
+	translator_translate_pending = False
+	translator_translate_since = 0
+	translator_job_id = 0
 	import array
 	import math
 	import pygame
@@ -1077,8 +1091,9 @@ def run_machine(config=None):
 	help_window = None
 	running = True
 	dropdown_rect = pygame.Rect(55, 270, 350, 52)
-	sound_button_rect = pygame.Rect(975, 270, 150, 52)
-	speed_button_rect = pygame.Rect(800, 270, 155, 52)
+	translate_lang_rect = pygame.Rect(460, 270, 220, 52)
+	sound_button_rect = pygame.Rect(865, 270, 130, 52)
+	speed_button_rect = pygame.Rect(700, 270, 145, 52)
 	record_slowmo_rect = pygame.Rect(800, 270, 155, 52)
 	record_slow_options = (1.0, 2.0, 3.0, 4.0)
 	record_slow_index = 0
@@ -1319,59 +1334,6 @@ def run_machine(config=None):
 				screen.blit(symbol_surface, (x_position, area.y + row * line_height))
 				x_position += symbol_surface.get_width() + 16
 
-	def draw_translation(text, area):
-		if not text:
-			screen.blit(font.render("Type a word or phrase...", True, muted_text), area.topleft)
-			return
-
-		items = []
-		for character in text.upper():
-			if character == " ":
-				items.append(" ")
-			elif character in MORSE_CODE:
-					items.append((character, MORSE_CODE[character]))
-		translation_font = pygame.font.Font(None, 30)
-		morse_font = pygame.font.Font(None, 30)
-		lines = [[]]
-		line_height = 0
-		for size in range(34, 13, -2):
-			translation_font = pygame.font.Font(None, max(size - 4, 12))
-			morse_font = pygame.font.Font(None, size)
-			lines = [[]]
-			line_width = 0
-			for item in items:
-				if item == " ":
-					line_width += morse_font.size("  ")[0]
-					continue
-				character, code = item
-				item_width = max(
-					translation_font.size(f"[{character}]")[0],
-					morse_font.size(code)[0],
-				) + 18
-				if lines[-1] and line_width + item_width > area.width:
-					lines.append([])
-					line_width = 0
-				lines[-1].append(item)
-				line_width += item_width
-			line_height = max(translation_font.get_linesize() + 4, morse_font.get_linesize()) + 8
-			if len(lines) * line_height <= area.height:
-				break
-
-		if len(lines) * line_height > area.height:
-			lines = lines[-3:]
-			lines[0].insert(0, ("...", ""))
-		label_height = translation_font.get_linesize()
-		morse_height = morse_font.get_linesize()
-		for row, line in enumerate(lines):
-			x_position = area.x
-			y_position = area.y + row * line_height
-			for character, code in line:
-				label = translation_font.render(f"[{character}]", True, accent)
-				pattern = morse_font.render(code, True, text_color)
-				screen.blit(label, (x_position, y_position))
-				screen.blit(pattern, (x_position, y_position + label_height + (line_height - label_height - morse_height) // 2))
-				x_position += max(label.get_width(), pattern.get_width()) + 18
-
 	def show_help():
 		nonlocal help_root, help_window
 		import tkinter as tk
@@ -1461,6 +1423,36 @@ def run_machine(config=None):
 
 	def same_lang_prefix(first, second):
 		return (first or "").lower().split("-")[0] == (second or "").lower().split("-")[0]
+
+	def ensure_translator():
+		nonlocal chat_translator
+		if chat_translator is None:
+			chat_translator = _Translator()
+		return chat_translator
+
+	def mark_translator_dirty():
+		nonlocal translator_translate_pending, translator_translate_since, translator_job_id
+		translator_job_id += 1
+		translator_translate_pending = True
+		translator_translate_since = pygame.time.get_ticks()
+
+	def submit_translator_translation():
+		nonlocal translator_translate_pending, translator_translation
+		translator_translate_pending = False
+		text = translator_text.strip()
+		if not text:
+			translator_translation = ""
+			return
+		translator = ensure_translator()
+		job_id = translator_job_id
+
+		def apply(translated):
+			nonlocal translator_translation
+			if job_id != translator_job_id:
+				return
+			translator_translation = translated
+
+		translator.submit(apply, text, translator_lang)
 
 	def add_chat_message(msg):
 		nonlocal chat_log
@@ -1659,21 +1651,45 @@ def run_machine(config=None):
 						if _option_rect.collidepoint(event.pos):
 							chat_display_lang = _code
 							chat_lang_open = False
+				elif mode == "Translator Mode" and translate_lang_rect.collidepoint(event.pos):
+					translator_lang_open = not translator_lang_open
+					speed_dropdown_open = False
+					if translator_lang_open:
+						_t_selected = next((_i for _i, (_t_code, _t_name) in enumerate(CHAT_LANGUAGES) if _t_code == translator_lang), 0)
+						_t_visible = max(1, (720 - (translate_lang_rect.y + 52)) // 34)
+						translator_lang_scroll = min(max(0, _t_selected - _t_visible // 2), max(0, len(CHAT_LANGUAGES) - _t_visible))
+				elif mode == "Translator Mode" and translator_lang_open:
+					_t_visible = max(1, (720 - (translate_lang_rect.y + 52)) // 34)
+					for _t_index in range(translator_lang_scroll, min(len(CHAT_LANGUAGES), translator_lang_scroll + _t_visible)):
+						_t_code, _t_name = CHAT_LANGUAGES[_t_index]
+						_t_option_rect = pygame.Rect(
+							translate_lang_rect.x,
+							translate_lang_rect.y + 52 + (_t_index - translator_lang_scroll) * 34,
+							translate_lang_rect.width,
+							34,
+						)
+						if _t_option_rect.collidepoint(event.pos):
+							if _t_code != translator_lang:
+								translator_lang = _t_code
+								mark_translator_dirty()
+							translator_lang_open = False
 				elif mode == "Translator Mode" and sound_button_rect.collidepoint(event.pos):
 					play_current()
 				elif mode == "Translator Mode" and speed_button_rect.collidepoint(event.pos):
 					speed_dropdown_open = not speed_dropdown_open
+					translator_lang_open = False
 				elif mode == "Record Mode" and record_slowmo_rect.collidepoint(event.pos):
 					record_slow_index = (record_slow_index + 1) % len(record_slow_options)
 					listener.slow_factor = record_slow_options[record_slow_index]
 				elif speed_dropdown_open:
 					for index, option in enumerate(speed_options):
-						option_rect = pygame.Rect(800, 322 + index * 38, 155, 38)
+						option_rect = pygame.Rect(speed_button_rect.x, 322 + index * 38, speed_button_rect.width, 38)
 						if option_rect.collidepoint(event.pos):
 							playback_speed = option
 							speed_dropdown_open = False
 				elif dropdown_rect.collidepoint(event.pos):
 					dropdown_open = not dropdown_open
+					translator_lang_open = False
 				elif dropdown_open:
 					for index, option in enumerate(mode_options):
 						option_rect = pygame.Rect(55, 322 + index * 46, 350, 46)
@@ -1689,6 +1705,10 @@ def run_machine(config=None):
 					_visible = max(1, (720 - (chat_lang_rect.y + 52)) // 34)
 					_max_scroll = max(0, len(CHAT_LANGUAGES) - _visible)
 					chat_lang_scroll = min(_max_scroll, max(0, chat_lang_scroll - event.y))
+				elif mode == "Translator Mode" and translator_lang_open:
+					_t_visible = max(1, (720 - (translate_lang_rect.y + 52)) // 34)
+					_t_max_scroll = max(0, len(CHAT_LANGUAGES) - _t_visible)
+					translator_lang_scroll = min(_t_max_scroll, max(0, translator_lang_scroll - event.y))
 			elif event.type == pygame.KEYDOWN:
 				if event.key == pygame.K_ESCAPE:
 					running = False
@@ -1698,8 +1718,10 @@ def run_machine(config=None):
 					select_mode(mode_options[(current_index + step) % len(mode_options)])
 				elif mode == "Translator Mode" and event.key == pygame.K_BACKSPACE:
 					translator_text = translator_text[:-1]
+					mark_translator_dirty()
 				elif mode == "Translator Mode" and event.key == pygame.K_DELETE:
 					translator_text = ""
+					mark_translator_dirty()
 				elif event.key == pygame.K_TAB:
 					show_help()
 				elif mode == "International Chat" and chat_mode == "morse_to_word":
@@ -1752,6 +1774,7 @@ def run_machine(config=None):
 			elif event.type == pygame.TEXTINPUT:
 				if mode == "Translator Mode":
 					translator_text += event.text
+					mark_translator_dirty()
 				elif mode == "International Chat" and chat_mode != "morse_to_word":
 					chat_input += event.text
 			elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and mode not in ("Translator Mode", "International Chat"):
@@ -1782,6 +1805,9 @@ def run_machine(config=None):
 						message += " "
 				else:
 					message += decoded
+
+		if mode == "Translator Mode" and translator_translate_pending and now - translator_translate_since >= 600:
+			submit_translator_translation()
 
 		if mode == "International Chat" and chat_client is not None:
 			while not chat_client.inbox.empty():
@@ -1836,13 +1862,21 @@ def run_machine(config=None):
 		pygame.draw.rect(screen, panel_highlight, dropdown_rect, border_radius=8)
 		screen.blit(font.render(mode, True, text_color), (73, 280))
 		screen.blit(font.render("v", True, accent), (375, 280))
-		screen.blit(font.render("Backspace deletes  |  Esc quits", True, muted_text), (455, 280))
-		screen.blit(font.render("Tab opens the Morse list", True, muted_text), (455, 315))
 		if mode == "Translator Mode":
-			pygame.draw.rect(screen, accent_soft, sound_button_rect, border_radius=8)
-			screen.blit(font.render("SOUND", True, text_color), (990, 280))
+			screen.blit(font.render("Backspace deletes  |  Tab shows the Morse list  |  Esc quits", True, muted_text), (455, 315))
+		else:
+			screen.blit(font.render("Backspace deletes  |  Esc quits", True, muted_text), (455, 280))
+			screen.blit(font.render("Tab opens the Morse list", True, muted_text), (455, 315))
+		if mode == "Translator Mode":
+			pygame.draw.rect(screen, panel_highlight, translate_lang_rect, border_radius=8)
+			_tlang_name = LANGUAGE_BY_CODE.get(translator_lang, translator_lang)
+			screen.blit(font.render(f"LANG: {_tlang_name}", True, text_color), (translate_lang_rect.x + 10, translate_lang_rect.y + 12))
+			screen.blit(font.render("v", True, accent), (translate_lang_rect.right - 26, translate_lang_rect.y + 12))
 			pygame.draw.rect(screen, panel_highlight, speed_button_rect, border_radius=8)
-			screen.blit(font.render("|  v", True, text_color), (940, 280))
+			screen.blit(font.render(f"{playback_speed:g}x", True, dash_color), (speed_button_rect.x + 14, speed_button_rect.y + 12))
+			screen.blit(font.render("v", True, accent), (speed_button_rect.right - 26, speed_button_rect.y + 12))
+			pygame.draw.rect(screen, accent_soft, sound_button_rect, border_radius=8)
+			screen.blit(font.render("SOUND", True, text_color), (sound_button_rect.x + 24, sound_button_rect.y + 12))
 		elif mode == "Record Mode":
 			pygame.draw.rect(screen, accent_soft, record_slowmo_rect, border_radius=8)
 			screen.blit(font.render(f"SLOW-MO ×{listener.slow_factor:g}", True, text_color), (802, 280))
@@ -1850,9 +1884,12 @@ def run_machine(config=None):
 		pygame.draw.rect(screen, panel, (35, 390, 535, 285), border_radius=12)
 		pygame.draw.rect(screen, panel, (600, 390, 565, 285), border_radius=12)
 		left_title = "TRANSLATOR INPUT" if mode == "Translator Mode" else "CURRENT MORSE"
-		right_title = "MORSE TRANSLATION" if mode == "Translator Mode" else "MESSAGE"
 		screen.blit(label_font.render(left_title, True, accent), (60, 420))
-		screen.blit(label_font.render(right_title, True, accent), (625, 420))
+		_tlang_name = LANGUAGE_BY_CODE.get(translator_lang, translator_lang)
+		if mode == "Translator Mode":
+			screen.blit(label_font.render(f"LANGUAGE TRANSLATION ({_tlang_name})", True, accent), (625, 420))
+		else:
+			screen.blit(label_font.render("MESSAGE", True, accent), (625, 420))
 		cursor = "|" if (now // 500) % 2 == 0 else " "
 		if mode == "Translator Mode":
 			draw_message(translator_text, pygame.Rect(60, 472, 470, 165))
@@ -1862,7 +1899,20 @@ def run_machine(config=None):
 				preview_code += "-" if now - press_started >= dash_threshold else "."
 			draw_morse(preview_code, pygame.Rect(60, 472, 470, 100), bool(cursor.strip()))
 		if mode == "Translator Mode":
-			draw_translation(translator_text, pygame.Rect(625, 462, 500, 180))
+			if translator_translation:
+				draw_message(translator_translation, pygame.Rect(625, 452, 500, 90))
+			else:
+				_t_hint = (
+					"Translating..."
+					if translator_translate_pending or translator_text.strip()
+					else f"Type text to translate into {_tlang_name}."
+				)
+				screen.blit(font.render(_t_hint, True, muted_text), (625, 452))
+			screen.blit(label_font.render("MORSE OUTPUT", True, muted_text), (625, 556))
+			_morse_encoded = encode(translator_text) if translator_text.strip() else ""
+			_morse_lines = _wrap_chat(_morse_encoded or " ", measure=lambda candidate: chat_font.size(candidate)[0])[:2]
+			for _m_index, _m_line in enumerate(_morse_lines):
+				screen.blit(chat_font.render(_m_line, True, text_color), (625, 596 + _m_index * 30))
 			prediction_text = "TYPE TO TRANSLATE"
 			prediction_label = "LETTER PREDICTION"
 		else:
@@ -1909,9 +1959,25 @@ def run_machine(config=None):
 				screen.blit(font.render(option, True, text_color), (73, 330 + index * 46))
 		if speed_dropdown_open and mode == "Translator Mode":
 			for index, option in enumerate(speed_options):
-				option_rect = pygame.Rect(800, 322 + index * 38, 155, 38)
+				option_rect = pygame.Rect(speed_button_rect.x, 322 + index * 38, speed_button_rect.width, 38)
 				pygame.draw.rect(screen, panel_highlight, option_rect)
-				screen.blit(font.render(f"{option}x", True, text_color), (815, 328 + index * 38))
+				screen.blit(font.render(f"{option}x", True, text_color), (speed_button_rect.x + 15, 328 + index * 38))
+		if translator_lang_open and mode == "Translator Mode":
+			_t_visible = max(1, (720 - (translate_lang_rect.y + 52)) // 34)
+			_t_max_scroll = max(0, len(CHAT_LANGUAGES) - _t_visible)
+			translator_lang_scroll = min(_t_max_scroll, max(0, translator_lang_scroll))
+			for _t_index in range(translator_lang_scroll, min(len(CHAT_LANGUAGES), translator_lang_scroll + _t_visible)):
+				_t_code, _t_name = CHAT_LANGUAGES[_t_index]
+				_t_option_rect = pygame.Rect(
+					translate_lang_rect.x,
+					translate_lang_rect.y + 52 + (_t_index - translator_lang_scroll) * 34,
+					translate_lang_rect.width,
+					34,
+				)
+				pygame.draw.rect(screen, panel_highlight, _t_option_rect, border_radius=6)
+				pygame.draw.rect(screen, accent_soft, _t_option_rect, width=1, border_radius=6)
+				_t_marker = " *" if _t_code == translator_lang else ""
+				screen.blit(font.render(_t_name + _t_marker, True, text_color), (_t_option_rect.x + 8, _t_option_rect.y + 6))
 		pygame.display.flip()
 		update_help()
 		clock.tick(120)

@@ -5,7 +5,9 @@ Run with:
 	python3 -m unittest test_morse -v
 """
 
+import time
 import unittest
+from unittest import mock
 
 import morse
 
@@ -237,6 +239,178 @@ class ChatWrapperTests(unittest.TestCase):
 		lines = morse._wrap_chat("A B C", measure=lambda candidate: len(candidate) * 1000)
 		self.assertEqual(" ".join(lines), "A B C")
 		self.assertGreaterEqual(len(lines), 1)
+
+
+class GoogleTranslateTargetTests(unittest.TestCase):
+	"""Criterion (issue #3): the selected language is the translation target,
+	the source language is auto-detected, and supported languages translate
+	into the currently selected language.
+
+	The public Google endpoint is mocked so the tests run offline. The mock
+	answers the same way translate.googleapis.com does: the first element of
+	each ``[[translated, source, ...], ...]`` chunk is the translated text.
+	"""
+
+	def setUp(self):
+		morse._translate_cached.cache_clear()
+
+	@staticmethod
+	def _patch_urlopen(table):
+		def fake_open(request, timeout=None):
+			from urllib.parse import parse_qs, urlparse
+			query = parse_qs(urlparse(request.full_url).query)
+			source = query.get("sl", ["?"])[0]
+			target = query.get("tl", ["?"])[0]
+			text = query.get("q", [""])[0]
+			translated = table.get((source, target, text), text)
+			payload = [[[translated, source, None, None]], None, source, None]
+			body = __import__("json").dumps(payload).encode("utf-8")
+			return mock.MagicMock(
+				__enter__=lambda self: self,
+				__exit__=lambda *args: False,
+				read=lambda: body,
+			)
+		return mock.patch.object(
+			morse.urllib.request, "urlopen", side_effect=fake_open, autospec=True
+		)
+
+	def test_english_to_russian(self):
+		table = {("auto", "ru", "hello world"): "привет мир"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("hello world", "ru"), "привет мир")
+
+	def test_german_to_russian(self):
+		table = {("auto", "ru", "guten tag"): "добрый день"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("guten tag", "ru"), "добрый день")
+
+	def test_french_to_russian(self):
+		table = {("auto", "ru", "bonjour"): "привет"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("bonjour", "ru"), "привет")
+
+	def test_spanish_to_russian(self):
+		table = {("auto", "ru", "hola"): "привет"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("hola", "ru"), "привет")
+
+	def test_japanese_to_russian(self):
+		table = {("auto", "ru", "こんにちは"): "привет"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("こんにちは", "ru"), "привет")
+
+	def test_supported_sources_all_translate_into_russian(self):
+		samples = {
+			"auto": {
+				"hello": "привет",
+				"guten tag": "добрый день",
+				"bonjour": "привет",
+				"hola": "привет",
+				"こんにちは": "привет",
+				"привет": "привет",
+			}
+		}
+		table = {("auto", "ru", text): out for text, out in samples["auto"].items()}
+		with self._patch_urlopen(table):
+			for source_text, russian in samples["auto"].items():
+				self.assertEqual(morse.google_translate(source_text, "ru"), russian, source_text)
+
+	def test_russian_to_english_when_target_changes(self):
+		table = {("auto", "en", "привет мир"): "hello world"}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("привет мир", "en"), "hello world")
+
+	def test_german_and_russian_into_english(self):
+		table = {
+			("auto", "en", "guten tag"): "good day",
+			("auto", "en", "привет мир"): "hello world",
+		}
+		with self._patch_urlopen(table):
+			self.assertEqual(morse.google_translate("guten tag", "en"), "good day")
+			self.assertEqual(morse.google_translate("привет мир", "en"), "hello world")
+
+	def test_target_language_is_sent_to_endpoint(self):
+		seen = []
+
+		def fake_open(request, timeout=None):
+			from urllib.parse import parse_qs, urlparse
+			seen.append(parse_qs(urlparse(request.full_url).query))
+			return mock.MagicMock(
+				__enter__=lambda self: self,
+				__exit__=lambda *args: False,
+				read=lambda: b'[[["out","auto",null,null]],null,"auto",null]',
+			)
+
+		with mock.patch.object(morse.urllib.request, "urlopen", side_effect=fake_open):
+			morse.google_translate("текст", "de")
+		self.assertEqual(seen[-1]["tl"], ["de"])
+		self.assertEqual(seen[-1]["sl"], ["auto"])
+
+	def test_failed_translation_returns_original_text(self):
+		with mock.patch.object(morse.urllib.request, "urlopen", side_effect=OSError("offline")):
+			self.assertEqual(morse.google_translate("hello world", "ru"), "hello world")
+
+	def test_empty_input_and_target_are_safe(self):
+		self.assertEqual(morse.google_translate("", "ru"), "")
+		self.assertEqual(morse.google_translate("hello", ""), "hello")
+		self.assertEqual(morse.google_translate(None, "ru"), None)
+
+
+class TranslatorWorkerTargetTests(unittest.TestCase):
+	"""Criterion (issue #3): the background worker translates messages into
+	the target language the caller selected, on a background thread."""
+
+	def test_worker_submits_selected_language_as_target(self):
+		seen = {}
+
+		def fake_google(text, target, source="auto"):
+			seen["text"] = text
+			seen["target"] = target
+			seen["source"] = source
+			return "TRANSLATED"
+
+		with mock.patch.object(morse, "google_translate", side_effect=fake_google):
+			worker = morse._Translator()
+			received = []
+			worker.submit(received.append, "hola", "ru")
+			deadline = time.time() + 3
+			while not received and time.time() < deadline:
+				time.sleep(0.02)
+			self.assertEqual(received, ["TRANSLATED"])
+		self.assertEqual(seen["text"], "hola")
+		self.assertEqual(seen["target"], "ru")
+		self.assertEqual(seen["source"], "auto")
+
+	def test_worker_uses_auto_source_detection(self):
+		seen = {}
+
+		def fake_google(text, target, source="auto"):
+			seen["source"] = source
+			return text
+
+		with mock.patch.object(morse, "google_translate", side_effect=fake_google):
+			worker = morse._Translator()
+			done = []
+			worker.submit(done.append, "texto", "es")
+			deadline = time.time() + 3
+			while not done and time.time() < deadline:
+				time.sleep(0.02)
+		self.assertEqual(seen["source"], "auto")
+
+
+class EncodeRobustnessTests(unittest.TestCase):
+	"""Criterion (issue #3): foreign-script input (e.g. Russian) must never
+	crash the Morse encoder, which is now fed by the translator mode."""
+
+	def test_encode_skips_unsupported_characters(self):
+		self.assertEqual(morse.encode("Привет мир"), "")
+		self.assertEqual(morse.encode("Guten Tag!"), "--. ..- - . -. / - .- --.")
+
+	def test_encode_still_round_trips_latin(self):
+		self.assertEqual(
+			morse.encode("hello world"),
+			".... . .-.. .-.. --- / .-- --- .-. .-.. -..",
+		)
 
 
 if __name__ == "__main__":
