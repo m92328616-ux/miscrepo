@@ -1447,7 +1447,8 @@ def run_machine(config=None):
 		translator_translate_since = pygame.time.get_ticks()
 
 	def submit_translator_translation():
-		nonlocal translator_translate_pending, translator_translation
+		nonlocal translator_translate_pending, translator_translation, translator_job_id
+		translator_job_id += 1
 		translator_translate_pending = False
 		text = translator_text.strip()
 		if not text:
@@ -1681,7 +1682,7 @@ def run_machine(config=None):
 						if _t_option_rect.collidepoint(event.pos):
 							if _t_code != translator_lang:
 								translator_lang = _t_code
-								mark_translator_dirty()
+								submit_translator_translation()
 							translator_lang_open = False
 				elif mode == "Translator Mode" and sound_button_rect.collidepoint(event.pos):
 					play_current()
