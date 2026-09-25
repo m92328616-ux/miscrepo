@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>htmlviewer</title>
+<style>
+[hidden] { display: none !important; }
+:root { --size: 15px; --col: #e6e6e6; --bg: #101418; --tool: #171d24; --acc: #4cc2ff; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--col); font-family: system-ui, sans-serif; }
+#toolbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: var(--tool); border-bottom: 1px solid #2a3340; flex-wrap: wrap; }
+#title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw; color: #fff; }
+#meta { color: #7f8b99; font-size: 12px; }
+#search { width: 260px; padding: 6px 10px; border-radius: 6px; border: 1px solid #2a3340;
+  background: #0c1014; color: var(--col); outline: none; }
+#search:focus { border-color: var(--acc); }
+#count { color: #7f8b99; font-size: 12px; min-width: 84px; }
+button { cursor: pointer; background: #1c2530; color: var(--col); border: 1px solid #2a3340;
+  border-radius: 6px; padding: 5px 10px; font-size: 13px; }
+button:hover { border-color: var(--acc); }
+#importBtn { border-color: var(--acc); color: #dff0ff; }
+main { overflow: auto; height: calc(100vh - 54px); }
+pre { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--size);
+  line-height: 1.5; padding: 12px 16px; margin: 0; white-space: pre; }
+pre.wrap { white-space: pre-wrap; word-break: break-word; }
+.ln { display: block; padding-right: 8px; }
+.ln-num { display: inline-block; width: 3ch; text-align: right; color: #58626f;
+  user-select: none; margin-right: 14px; font-size: 12px; }
+.ln-num.hidden { display: none; }
+mark { background: #c9a227; color: #1a1a1a; border-radius: 2px; padding: 0 1px; }
+mark.current { background: #4cc2ff; color: #0b0f13; }
+::selection { background: #2b4a63; }
+#drop { display: flex; align-items: center; justify-content: center; height: 100%; min-height: 320px;
+  flex-direction: column; gap: 10px; color: #7f8b99; border: 2px dashed #2a3340;
+  margin: 24px; border-radius: 12px; text-align: center; padding: 24px; }
+#drop.hover, #drop.droppable { border-color: var(--acc); color: var(--col); }
+iframe.doc { width: 100%; height: 100%; border: 0; background: #fff; }
+.help { font-size: 12px; color: #58626f; }
+</style>
+</head>
+<body>
+<header id="toolbar">
+  <span id="title">htmlviewer</span>
+  <span id="meta"></span>
+  <input id="search" type="search" placeholder="Search&hellip;" autocomplete="off" spellcheck="false" hidden>
+  <span id="count" hidden></span>
+  <span style="flex:1"></span>
+  <button id="wrapBtn" hidden>Wrap</button>
+  <button id="lineBtn" hidden>Lines</button>
+  <button id="zIn" title="Zoom in" hidden>+</button>
+  <button id="zOut" title="Zoom out" hidden>&minus;</button>
+  <button id="importBtn">Import file&hellip;</button>
+  <button id="closeBtn" title="Close document" hidden>&times;</button>
+  <input id="file" type="file" hidden>
+</header>
+<main id="viewport">
+  <div id="drop">
+    <div style="font-size:17px">Drop a file here or click to import</div>
+    <div class="help">Text files become a searchable, scrollable page. HTML files render as-is.</div>
+    <button id="dropBtn">Import file&hellip;</button>
+    <div class="help">Serve this app with: python3 htmlviewer.py</div>
+  </div>
+  <pre id="code" hidden><code id="lines"></code></pre>
+  <iframe id="iframe" class="doc" hidden></iframe>
+</main>
+<script>
+var pre = document.getElementById("code");
+var linesEl = document.getElementById("lines");
+var iframe = document.getElementById("iframe");
+var drop = document.getElementById("drop");
+var box = document.getElementById("search");
+var count = document.getElementById("count");
+var titleEl = document.getElementById("title");
+var metaEl = document.getElementById("meta");
+var lineEls = [];
+var plain = [];
+var marks = [];
+var current = -1;
+
+var DB_NAME = "htmlviewer-offline";
+var DB_VER = 1;
+var STORE = "docs";
+var dbPromise = null;
+
+function openDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise(function (resolve, reject) {
+    var req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = function () {
+      var db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+    };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error); };
+  });
+  return dbPromise;
+}
+
+function cacheDoc(id, rec) {
+  openDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put(rec, id);
+      tx.oncomplete = resolve;
+      tx.onerror = function () { reject(tx.error); };
+    });
+  }).catch(function () {});
+}
+
+function loadCached(id) {
+  return openDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE, "readonly");
+      var req = tx.objectStore(STORE).get(id);
+      req.onsuccess = function () { resolve(req.result || null); };
+      req.onerror = function () { reject(req.error); };
+    });
+  });
+}
+
+function makeLine(number, text) {
+  var row = document.createElement("span");
+  row.className = "ln";
+  var num = document.createElement("span");
+  num.className = "ln-num";
+  num.textContent = String(number);
+  var tx = document.createElement("span");
+  tx.className = "ln-text";
+  tx.textContent = text;
+  row.appendChild(num);
+  row.appendChild(tx);
+  return row;
+}
+
+function showTextUI() {
+  pre.hidden = false;
+  iframe.hidden = true;
+  drop.hidden = true;
+  box.hidden = false;
+  count.hidden = false;
+  document.getElementById("wrapBtn").hidden = false;
+  document.getElementById("lineBtn").hidden = false;
+  document.getElementById("zIn").hidden = false;
+  document.getElementById("zOut").hidden = false;
+  document.getElementById("closeBtn").hidden = false;
+}
+
+function showHtmlUI() {
+  pre.hidden = true;
+  iframe.hidden = false;
+  drop.hidden = true;
+  box.hidden = true;
+  count.hidden = true;
+  document.getElementById("wrapBtn").hidden = true;
+  document.getElementById("lineBtn").hidden = true;
+  document.getElementById("zIn").hidden = true;
+  document.getElementById("zOut").hidden = true;
+  document.getElementById("closeBtn").hidden = false;
+}
+
+function showEmpty() {
+  drop.hidden = false;
+  pre.hidden = true;
+  iframe.hidden = true;
+  box.hidden = true;
+  count.hidden = true;
+  document.getElementById("wrapBtn").hidden = true;
+  document.getElementById("lineBtn").hidden = true;
+  document.getElementById("zIn").hidden = true;
+  document.getElementById("zOut").hidden = true;
+  document.getElementById("closeBtn").hidden = true;
+}
+
+function renderText(text) {
+  var rows = text.split(/\r?\n/);
+  linesEl.textContent = "";
+  lineEls = [];
+  var frag = document.createDocumentFragment();
+  rows.forEach(function (line, i) {
+    var el = makeLine(i + 1, line);
+    frag.appendChild(el);
+    lineEls.push(el.firstChild.nextSibling);
+  });
+  linesEl.appendChild(frag);
+  plain = lineEls.map(function (el) { return el.textContent; });
+  showTextUI();
+}
+
+function renderHtml(text) {
+  iframe.src = URL.createObjectURL(new Blob([text], { type: "text/html" }));
+  showHtmlUI();
+}
+
+function walk(node, q) {
+  var kids = Array.prototype.slice.call(node.childNodes);
+  kids.forEach(function (child) {
+    if (child.nodeType === 3) {
+      var v = child.nodeValue;
+      var idx = v.toLowerCase().indexOf(q);
+      if (idx >= 0) {
+        var before = document.createTextNode(v.slice(0, idx));
+        var mark = document.createElement("mark");
+        mark.textContent = v.slice(idx, idx + q.length);
+        var after = document.createTextNode(v.slice(idx + q.length));
+        node.replaceChild(after, child);
+        node.insertBefore(mark, after);
+        node.insertBefore(before, mark);
+        marks.push(mark);
+      }
+    } else {
+      walk(child, q);
+    }
+  });
+}
+
+function clear() {
+  marks = [];
+  lineEls.forEach(function (el, i) { el.textContent = plain[i]; });
+}
+
+function jump(dir) {
+  if (!marks.length) return;
+  current = (current + dir + marks.length) % marks.length;
+  marks.forEach(function (m, i) { m.classList.toggle("current", i === current); });
+  count.textContent = (current + 1) + "/" + marks.length + " matches";
+  var node = marks[current];
+  if (node.scrollIntoView) node.scrollIntoView({ block: "center" });
+}
+
+box.addEventListener("input", function () {
+  clear();
+  current = -1;
+  var q = box.value.trim().toLowerCase();
+  if (!q) { count.textContent = ""; return; }
+  lineEls.forEach(function (el) { walk(el, q); });
+  count.textContent = marks.length ? "1/" + marks.length + " matches" : "0 matches";
+});
+
+box.addEventListener("keydown", function (event) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  jump(event.shiftKey ? -1 : 1);
+});
+
+document.getElementById("wrapBtn").addEventListener("click", function () {
+  pre.classList.toggle("wrap");
+});
+
+document.getElementById("lineBtn").addEventListener("click", function () {
+  document.querySelectorAll(".ln-num").forEach(function (n) { n.classList.toggle("hidden"); });
+});
+
+document.getElementById("zIn").addEventListener("click", function () {
+  zoom(1.2);
+});
+document.getElementById("zOut").addEventListener("click", function () {
+  zoom(1 / 1.2);
+});
+
+function zoom(factor) {
+  var root = document.documentElement;
+  var size = parseFloat(getComputedStyle(root).getPropertyValue("--size")) || 15;
+  root.style.setProperty("--size", Math.min(60, Math.max(8, size * factor)).toFixed(2) + "px");
+}
+
+function importFile(file) {
+  if (!file) return;
+  fetch("/import", {
+    method: "POST",
+    headers: { "X-Filename": encodeURIComponent(file.name) },
+    body: file
+  }).then(function (res) {
+    if (!res.ok) throw new Error("import failed: " + res.status);
+    return res.json();
+  }).then(function (json) {
+    if (json && json.id) location.href = location.pathname + "?id=" + encodeURIComponent(json.id);
+  }).catch(function (err) {
+    alert("Import failed: " + err.message);
+  });
+}
+
+function load(id) {
+  fetch("/doc/" + encodeURIComponent(id)).then(function (res) {
+    if (!res.ok) throw new Error(res.status + " for " + id);
+    var ctype = res.headers.get("Content-Type") || "";
+    var name = res.headers.get("X-Doc-Name") || id;
+    return res.text().then(function (text) {
+      var rec = { name: decodeURIComponent(name), isHtml: ctype.indexOf("text/html") >= 0, text: text };
+      showDoc(rec, false);
+      cacheDoc(id, rec);
+    });
+  }).catch(function (err) {
+    loadCached(id).then(function (rec) {
+      if (rec && rec.text !== undefined) {
+        showDoc(rec, true);
+      } else {
+        showEmpty();
+        metaEl.textContent = "";
+        alert("Could not load document: " + err.message);
+      }
+    });
+  });
+}
+
+function showDoc(rec, offline) {
+  titleEl.textContent = rec.name;
+  document.title = rec.name + " — htmlviewer";
+  clear();
+  box.value = "";
+  var n = rec.text.split(/\r?\n/).length;
+  if (rec.isHtml) {
+    metaEl.textContent = "HTML \u00b7 " + n + " lines" + (offline ? " \u00b7 offline copy" : "");
+    renderHtml(rec.text);
+  } else {
+    metaEl.textContent = n + " lines" + (offline ? " \u00b7 offline copy" : "");
+    renderText(rec.text);
+  }
+}
+
+document.getElementById("closeBtn").addEventListener("click", function () {
+  var old = iframe.src;
+  if (old) {
+    iframe.src = "";
+    URL.revokeObjectURL(old);
+  }
+  if (history.replaceState) history.replaceState(null, "", location.pathname);
+  showEmpty();
+  titleEl.textContent = "htmlviewer";
+  document.title = "htmlviewer";
+});
+
+document.getElementById("importBtn").addEventListener("click", function () {
+  document.getElementById("file").click();
+});
+
+document.getElementById("dropBtn").addEventListener("click", function () {
+  document.getElementById("file").click();
+});
+
+document.getElementById("file").addEventListener("change", function (event) {
+  importFile(event.target.files[0]);
+  this.value = "";
+});
+
+window.addEventListener("dragover", function (event) {
+  event.preventDefault();
+  drop.classList.add("hover");
+});
+window.addEventListener("dragleave", function () {
+  drop.classList.remove("hover");
+});
+window.addEventListener("drop", function (event) {
+  event.preventDefault();
+  drop.classList.remove("hover");
+  if (event.dataTransfer && event.dataTransfer.files.length) {
+    importFile(event.dataTransfer.files[0]);
+  }
+});
+
+var id = new URLSearchParams(location.search).get("id");
+if (id) {
+  load(id);
+} else {
+  showEmpty();
+}
+</script>
+</body>
+</html>
