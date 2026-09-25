@@ -19,6 +19,18 @@ def encode_word(word):
 	return "".join(morse.MORSE_CODE[char] for char in word)
 
 
+def morse_module():
+	"""Return the real ``morse.py`` module object.
+
+	From the ``morse/`` directory ``import morse`` gives the module itself;
+	from the repository root it gives the ``morse`` package, whose ``morse``
+	attribute is that same module.  The background translator resolves
+	``google_translate`` from the module's own globals, so tests must patch
+	the module object, not the package wrapper.
+	"""
+	return getattr(morse, "morse", morse)
+
+
 class DecodeCorrectnessTests(unittest.TestCase):
 	"""Criterion: Morse input consistently produces the correct decoded letters."""
 
@@ -512,7 +524,7 @@ class TranslatorWorkerTargetTests(unittest.TestCase):
 			seen["source"] = source
 			return "TRANSLATED"
 
-		with mock.patch.object(morse, "google_translate", side_effect=fake_google):
+		with mock.patch.object(morse_module(), "google_translate", side_effect=fake_google):
 			worker = morse._Translator()
 			received = []
 			worker.submit(received.append, "hola", "ru")
@@ -531,7 +543,7 @@ class TranslatorWorkerTargetTests(unittest.TestCase):
 			seen["source"] = source
 			return text
 
-		with mock.patch.object(morse, "google_translate", side_effect=fake_google):
+		with mock.patch.object(morse_module(), "google_translate", side_effect=fake_google):
 			worker = morse._Translator()
 			done = []
 			worker.submit(done.append, "texto", "es")
