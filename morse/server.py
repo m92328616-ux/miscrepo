@@ -693,10 +693,6 @@ function morseSlashKey() {
   state.morseBuf = state.morseBuf.trim() + " / ";
 }
 
-function sameLang(a, b) {
-  return (a || "").split("-")[0].toLowerCase() === (b || "").split("-")[0].toLowerCase();
-}
-
 function translateText(text, target) {
   if (!text || !target) return Promise.resolve(text);
   var key = target + ":" + text;
@@ -754,7 +750,7 @@ function addChat(m) {
     entry.appendChild(note);
     entry._note = note;
     translateText(m.text, state.lang).then(function(t) { note.textContent = "-> " + t; });
-  } else if (!isMorse && m.text && (m.own || (m.lang && !sameLang(m.lang, state.lang)))) {
+  } else if (!isMorse && m.text) {
     entry._body = body;
     translateText(m.text, state.lang).then(function(t) { entry._translated = t; renderTranslation(entry); });
   }
@@ -790,9 +786,15 @@ function retranslateAll() {
     if (!el._sent) continue;
     if (el._isMorse) {
       var note = el._note;
-      if (note) translateText(el._sent, state.lang).then(function(t) { note.textContent = "-> " + t; });
+      if (note) {
+        (function(n) {
+          translateText(el._sent, state.lang).then(function(t) { n.textContent = "-> " + t; });
+        })(note);
+      }
     } else if (el._body) {
-      translateText(el._sent, state.lang).then(function(t) { el._translated = t; renderTranslation(el); });
+      (function(elm) {
+        translateText(el._sent, state.lang).then(function(t) { elm._translated = t; renderTranslation(elm); });
+      })(el);
     }
   }
 }

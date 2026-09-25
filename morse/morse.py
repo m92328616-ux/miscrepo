@@ -1592,9 +1592,6 @@ def run_machine(config=None):
 			if source:
 				submit_translation(entry, source, entry.get("morse"))
 
-	def same_lang_prefix(first, second):
-		return (first or "").lower().split("-")[0] == (second or "").lower().split("-")[0]
-
 	def ensure_translator():
 		nonlocal chat_translator
 		if chat_translator is None:
@@ -1645,8 +1642,7 @@ def run_machine(config=None):
 			elif text:
 				entry = {"kind": "chat", "nick": nick, "country": country, "lines": wrap_chat(text), "source": text}
 				chat_log.append(entry)
-				if msg.get("own") or not same_lang_prefix(msg.get("lang"), chat_display_lang):
-					submit_translation(entry, text, None)
+				submit_translation(entry, text, None)
 		if len(chat_log) > 300:
 			del chat_log[:50]
 
