@@ -1498,46 +1498,72 @@ def run_machine(config=None):
 		import tkinter as tk
 
 		if help_window is not None:
-			if help_window.winfo_viewable():
-				help_window.withdraw()
-			else:
-				help_window.deiconify()
-				help_window.lift()
+			help_window.deiconify()
+			help_window.lift()
 			return
+
+		def forward_key(event, event_type):
+			aliases = {
+				"backspace": pygame.K_BACKSPACE,
+				"delete": pygame.K_DELETE,
+				"escape": pygame.K_ESCAPE,
+				"return": pygame.K_RETURN,
+				"kp_enter": pygame.K_KP_ENTER,
+				"tab": pygame.K_TAB,
+				"space": pygame.K_SPACE,
+				"period": pygame.K_PERIOD,
+				"minus": pygame.K_MINUS,
+				"up": pygame.K_UP,
+				"down": pygame.K_DOWN,
+			}
+			key_name = event.keysym.lower()
+			try:
+				key = aliases[key_name] if key_name in aliases else pygame.key.key_code(key_name)
+			except ValueError:
+				return "break"
+			pygame.event.post(pygame.event.Event(event_type, key=key, mod=0, scancode=0))
+			if event_type == pygame.KEYDOWN and event.char and event.char.isprintable() and not event.state & 0x0C:
+				pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=event.char))
+			return "break"
 
 		help_root = tk.Tk()
 		help_root.withdraw()
 		help_window = tk.Toplevel(help_root)
-		help_window.title("Morse Code List")
-		help_window.geometry("620x300")
+		help_window.overrideredirect(True)
+		help_window.attributes("-topmost", True)
+		help_window.geometry("620x300+290+210")
 		help_window.configure(bg="#18222f")
-		help_window.protocol("WM_DELETE_WINDOW", help_window.withdraw if help_window is not None else (lambda: None))
-		help_window.bind("<Tab>", lambda _event: help_window.withdraw() if help_window is not None else None)
+		help_window.protocol("WM_DELETE_WINDOW", help_window.withdraw)
+		help_root.bind_all("<KeyPress>", lambda event: forward_key(event, pygame.KEYDOWN))
+		help_root.bind_all("<KeyRelease>", lambda event: forward_key(event, pygame.KEYUP))
 
-		title = tk.Label(
-			help_window,
-			text="MORSE CODE LIST",
-			bg="#18222f",
-			fg="#4dc9b0",
-			font=("DejaVu Sans", 16, "bold"),
-		)
-		title.pack(pady=(16, 10))
-		paragraph = "    ".join(
-			f"{character}:{code}" for character, code in MORSE_CODE.items()
-		)
-		body = tk.Label(
-			help_window,
-			text=paragraph,
-			bg="#1f2c3b",
-			fg="#ebf0f5",
-			font=("DejaVu Sans Mono", 12),
-			justify="left",
-			anchor="nw",
-			padx=14,
-			pady=14,
-			wraplength=580,
-		)
-		body.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+		titlebar = tk.Frame(help_window, bg="#2d585b", height=48)
+		titlebar.pack(fill="x")
+		titlebar.pack_propagate(False)
+		title = tk.Label(titlebar, text="MORSE CODE LIST", bg="#2d585b", fg="#4dc9b0", font=("DejaVu Sans", 16, "bold"))
+		title.pack(side="left", padx=18)
+		close = tk.Label(titlebar, text="X", bg="#1f2c3b", fg="#ebf0f5", font=("DejaVu Sans", 14, "bold"), width=3, cursor="hand2")
+		close.pack(side="right", padx=8, pady=8)
+		close.bind("<Button-1>", lambda _event: help_window.withdraw())
+
+		body = tk.Frame(help_window, bg="#1f2c3b")
+		body.pack(fill="both", expand=True, padx=0, pady=0)
+		for index, (character, code) in enumerate(MORSE_CODE.items()):
+			entry = tk.Label(body, text=f"{character}: {code}", bg="#1f2c3b", fg="#ebf0f5", font=("DejaVu Sans Mono", 12), anchor="w")
+			entry.grid(row=index % 6, column=index // 6, sticky="w", padx=(18, 8), pady=7)
+
+		def begin_drag(event):
+			help_window.drag_offset_x = event.x_root - help_window.winfo_x()
+			help_window.drag_offset_y = event.y_root - help_window.winfo_y()
+
+		def drag_window(event):
+			x = event.x_root - help_window.drag_offset_x
+			y = event.y_root - help_window.drag_offset_y
+			help_window.geometry(f"620x300{x:+d}{y:+d}")
+
+		for widget in (titlebar, title):
+			widget.bind("<Button-1>", begin_drag)
+			widget.bind("<B1-Motion>", drag_window)
 
 	def update_help():
 		if help_root is None:
@@ -1966,6 +1992,7 @@ def run_machine(config=None):
 					press_started = None
 					last_dot = None
 					dot_emitted = False
+		update_help()
 
 		if mode == "Dot Stream Mode" and press_started is not None:
 			while last_dot is not None and now - last_dot >= dot_interval:
@@ -1997,7 +2024,6 @@ def run_machine(config=None):
 		if mode == "International Chat":
 			draw_chat_screen(now)
 			pygame.display.flip()
-			update_help()
 			clock.tick(120)
 			continue
 
@@ -2165,7 +2191,6 @@ def run_machine(config=None):
 				_t_marker = " *" if _t_code == translator_lang else ""
 				screen.blit(font.render(_t_name + _t_marker, True, text_color), (_t_option_rect.x + 8, _t_option_rect.y + 6))
 		pygame.display.flip()
-		update_help()
 		clock.tick(120)
 
 	if help_root is not None:
